@@ -21,24 +21,29 @@ Write-Host "RAM mode updated: $prevMode -> $Mode (effective on next server start
 Write-Host ("Flags for '$Mode': " + $(if ($Mode -eq 'Prealloc') { $cfg.PreallocFlags } else { $cfg.DynamicFlags }))
 
 if ($RestartServerNow) {
+  $serverPid = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 25575 -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -First 1 -ExpandProperty OwningProcess
+
   Write-Host "Gracefully stopping running server via RCON..."
   try {
-    & $mcCmd -Command 'save-all flush' | Out-Null
-    & $mcCmd -Command 'stop' | Out-Null
+    & $mcCmd -Command 'save-all flush' -TimeoutMs 20000 | Out-Null
+    & $mcCmd -Command 'stop' -TimeoutMs 10000 | Out-Null
   } catch {
     Write-Warning "RCON stop check: $_"
   }
 
   $deadline = (Get-Date).AddSeconds(45)
   while ((Get-Date) -lt $deadline) {
-    $procs = Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -match 'purpur-' }
-    if (-not $procs) { break }
+    $portUp = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 25575 -State Listen -ErrorAction SilentlyContinue
+    $procUp = if ($serverPid) { Get-Process -Id $serverPid -ErrorAction SilentlyContinue } else { $null }
+    if (-not $portUp -and -not $procUp) { break }
     Start-Sleep -Seconds 1
   }
 
-  $remaining = Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -match 'purpur-' }
-  if ($remaining) {
-    throw "Server java.exe process is still running after 45s. Aborting task restart."
+  $stillPort = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 25575 -State Listen -ErrorAction SilentlyContinue
+  $stillProc = if ($serverPid) { Get-Process -Id $serverPid -ErrorAction SilentlyContinue } else { $null }
+  if ($stillPort -or $stillProc) {
+    throw "Server process is still running after 45s. Aborting task restart."
   }
 
   Write-Host "Starting Scheduled Task '$TaskName' in $Mode mode..."
@@ -46,7 +51,8 @@ if ($RestartServerNow) {
     Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
   } catch {
     Write-Host "Elevation required to start Scheduled Task; requesting UAC..."
-    $p = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "Start-ScheduledTask -TaskName '$TaskName'") -Verb RunAs -Wait -PassThru
+    $safeTaskName = $TaskName.Replace("'", "''")
+    $p = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "Start-ScheduledTask -TaskName '$safeTaskName'") -Verb RunAs -Wait -PassThru
     if ($p.ExitCode -ne 0) { throw "Failed to start '$TaskName' (exit $($p.ExitCode))." }
   }
   Write-Host "Scheduled Task '$TaskName' started."

@@ -13,6 +13,14 @@ if (-not (Test-Path $SecretFile)) {
   throw "RCON secret file not found: $SecretFile"
 }
 $password = (Get-Content -Path $SecretFile -Raw).Trim()
+$maxResponseBytes = 65536
+$deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+
+function Get-RemainingTimeoutMs {
+  $rem = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+  if ($rem -le 0) { throw "RCON operation exceeded total timeout (${TimeoutMs}ms)." }
+  return $rem
+}
 
 function Write-RconPacket([System.IO.Stream]$Stream, [int]$RequestId, [int]$Type, [string]$Payload) {
   $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes($Payload)
@@ -28,10 +36,11 @@ function Write-RconPacket([System.IO.Stream]$Stream, [int]$RequestId, [int]$Type
   $Stream.Flush()
 }
 
-function Read-ExactBytes([System.IO.Stream]$Stream, [int]$Count) {
+function Read-ExactBytes([System.Net.Sockets.TcpClient]$Client, [System.IO.Stream]$Stream, [int]$Count) {
   $buf = New-Object byte[] $Count
   $offset = 0
   while ($offset -lt $Count) {
+    $Client.ReceiveTimeout = Get-RemainingTimeoutMs
     $read = $Stream.Read($buf, $offset, $Count - $offset)
     if ($read -le 0) { throw "RCON connection closed unexpectedly." }
     $offset += $read
@@ -39,13 +48,13 @@ function Read-ExactBytes([System.IO.Stream]$Stream, [int]$Count) {
   return $buf
 }
 
-function Read-RconPacket([System.IO.Stream]$Stream) {
-  $lenBytes = Read-ExactBytes $Stream 4
+function Read-RconPacket([System.Net.Sockets.TcpClient]$Client, [System.IO.Stream]$Stream) {
+  $lenBytes = Read-ExactBytes $Client $Stream 4
   $len = [BitConverter]::ToInt32($lenBytes, 0)
-  if ($len -lt 10 -or $len -gt 1048576) {
-    throw "Invalid RCON packet length: $len"
+  if ($len -lt 10 -or $len -gt $maxResponseBytes) {
+    throw "Invalid or oversized RCON packet length: $len"
   }
-  $body = Read-ExactBytes $Stream $len
+  $body = Read-ExactBytes $Client $Stream $len
   $reqId = [BitConverter]::ToInt32($body, 0)
   $type = [BitConverter]::ToInt32($body, 4)
   $payloadLen = [Math]::Max(0, $len - 10)
@@ -54,16 +63,20 @@ function Read-RconPacket([System.IO.Stream]$Stream) {
 }
 
 $client = New-Object System.Net.Sockets.TcpClient
-$client.ReceiveTimeout = $TimeoutMs
 $client.SendTimeout = $TimeoutMs
 try {
-  $client.Connect($HostAddress, $Port)
+  $iar = $client.BeginConnect($HostAddress, $Port, $null, $null)
+  if (-not $iar.AsyncWaitHandle.WaitOne((Get-RemainingTimeoutMs), $false)) {
+    throw "Timed out connecting to RCON at ${HostAddress}:${Port}"
+  }
+  $client.EndConnect($iar)
   $stream = $client.GetStream()
 
   Write-RconPacket $stream 1 3 $password
   $authResp = $null
   while ($true) {
-    $pkt = Read-RconPacket $stream
+    $null = Get-RemainingTimeoutMs
+    $pkt = Read-RconPacket $client $stream
     if ($pkt.Type -eq 2) {
       $authResp = $pkt
       break
@@ -77,12 +90,18 @@ try {
   Write-RconPacket $stream 11 0 ''
 
   $sb = New-Object System.Text.StringBuilder
+  $totalBytes = 0
   while ($true) {
-    $pkt = Read-RconPacket $stream
+    $null = Get-RemainingTimeoutMs
+    $pkt = Read-RconPacket $client $stream
     if ($pkt.Id -eq 11) {
       break
     }
     if ($pkt.Id -eq 10 -and $pkt.Payload) {
+      $totalBytes += $pkt.Payload.Length
+      if ($totalBytes -gt $maxResponseBytes) {
+        throw "RCON response exceeded ${maxResponseBytes} byte limit."
+      }
       [void]$sb.Append($pkt.Payload)
     }
   }

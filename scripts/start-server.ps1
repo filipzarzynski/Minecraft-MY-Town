@@ -17,6 +17,13 @@ function Resolve-JavaExe {
   throw "Java binary (java.exe) not found."
 }
 
+function Assert-NotReparsePoint([string]$Path) {
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+    throw "SECURITY ABORT: ReparsePoint detected at $Path"
+  }
+}
+
 $ramConfigFile = Join-Path $ServerRoot 'scripts\ram-mode.json'
 $logFile = Join-Path $ServerRoot 'logs\wrapper.log'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $logFile) | Out-Null
@@ -27,12 +34,27 @@ function Write-WrapperLog([string]$Message) {
 }
 
 try {
+  Assert-NotReparsePoint $ServerRoot
+  Assert-NotReparsePoint $ramConfigFile
+
   $javaExe = Resolve-JavaExe
-  $purpurJar = Get-ChildItem -Path $ServerRoot -Filter 'purpur-*.jar' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-  if (-not $purpurJar) { throw "No purpur-*.jar found in $ServerRoot" }
-  if (-not (Test-Path $ramConfigFile)) { throw "Missing RAM mode config: $ramConfigFile" }
+  Assert-NotReparsePoint $javaExe
 
   $cfg = Get-Content -Path $ramConfigFile -Raw | ConvertFrom-Json
+  if (-not [string]::IsNullOrWhiteSpace($cfg.ServerJar)) {
+    $jarName = [System.IO.Path]::GetFileName([string]$cfg.ServerJar)
+    $purpurJarPath = Join-Path $ServerRoot $jarName
+    if (-not (Test-Path -LiteralPath $purpurJarPath)) { throw "Pinned ServerJar not found: $purpurJarPath" }
+    $purpurJar = Get-Item -LiteralPath $purpurJarPath
+  } else {
+    $candidates = @(Get-ChildItem -Path $ServerRoot -Filter 'purpur-*.jar' -File)
+    if ($candidates.Count -ne 1) {
+      throw "ServerJar is not pinned in ram-mode.json and found $($candidates.Count) purpur-*.jar files. Run bootstrap-server.ps1 or set ServerJar."
+    }
+    $purpurJar = $candidates[0]
+  }
+  Assert-NotReparsePoint $purpurJar.FullName
+
   $mode = $cfg.Mode
   $memFlags = switch ($mode) {
     'Prealloc' { $cfg.PreallocFlags }

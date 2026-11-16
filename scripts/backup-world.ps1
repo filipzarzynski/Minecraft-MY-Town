@@ -31,12 +31,52 @@ function Resolve-RclonePath {
   throw "rclone.exe not found. Install Rclone.Rclone first."
 }
 
+function Assert-NoReparsePoints([string]$TargetPath) {
+  if (-not (Test-Path -LiteralPath $TargetPath)) { return }
+  $item = Get-Item -LiteralPath $TargetPath -Force
+  if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+    throw "SECURITY ABORT: ReparsePoint (junction/symlink) detected at $TargetPath"
+  }
+  if ($item.PSIsContainer) {
+    $bad = Get-ChildItem -LiteralPath $TargetPath -Force -Recurse -ErrorAction Stop |
+      Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint } |
+      Select-Object -First 1
+    if ($bad) {
+      throw "SECURITY ABORT: ReparsePoint (junction/symlink) detected inside backup source at $($bad.FullName)"
+    }
+  }
+}
+
 $rcloneExe = Resolve-RclonePath
 if (-not (Test-Path $rcloneConfig)) {
   throw "Missing rclone config at $rcloneConfig. Run: rclone config create gdrive drive scope drive.file --config `"$rcloneConfig`""
 }
 if ((Get-Content -Path $rcloneConfig -Raw) -match 'CHANGE-ME') {
   throw "$rcloneConfig still contains placeholder OAuth tokens. Run: rclone config create gdrive drive scope drive.file --config `"$rcloneConfig`""
+}
+
+$foldersToCopy = @('world', 'world_nether', 'world_the_end', 'config')
+$filesToCopy = @(
+  'server.properties',
+  'purpur.yml',
+  'bukkit.yml',
+  'spigot.yml',
+  'plugins\MYTownGatekeeper\accounts.yml',
+  'plugins\MYTownGatekeeper\config.yml',
+  'plugins\playit-gg\config.yml'
+)
+
+Assert-NoReparsePoints $ServerRoot
+foreach ($folder in $foldersToCopy) {
+  Assert-NoReparsePoints (Join-Path $ServerRoot $folder)
+}
+foreach ($rel in $filesToCopy) {
+  $parts = $rel -split '\\'
+  $cur = $ServerRoot
+  foreach ($seg in $parts) {
+    $cur = Join-Path $cur $seg
+    Assert-NoReparsePoints $cur
+  }
 }
 
 $stamp = (Get-Date).ToString('yyyy-MM-dd_HHmm')
@@ -60,56 +100,60 @@ Write-BackupLog "Starting backup $stamp (ServerOnline=$serverRunning)"
 New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
 
 try {
-  if ($serverRunning) {
-    & $mcCmd -Command 'save-off' | Out-Null
-    & $mcCmd -Command 'save-all flush' | Out-Null
-    Start-Sleep -Seconds 2
-  }
+  try {
+    if ($serverRunning) {
+      & $mcCmd -Command 'save-off' -TimeoutMs 15000 | Out-Null
+      & $mcCmd -Command 'save-all flush' -TimeoutMs 30000 | Out-Null
+      Start-Sleep -Seconds 2
+    }
 
-  $foldersToCopy = @('world', 'world_nether', 'world_the_end', 'config')
-  foreach ($folder in $foldersToCopy) {
-    $src = Join-Path $ServerRoot $folder
-    if (Test-Path $src) {
-      $dst = Join-Path $stagingDir $folder
-      & robocopy $src $dst /E /R:1 /W:1 /XF session.lock /NFL /NDL /NJH /NJS /NC /NS | Out-Null
-      if ($LASTEXITCODE -ge 8) {
-        throw "robocopy failed for $folder with exit code $LASTEXITCODE"
+    foreach ($folder in $foldersToCopy) {
+      $src = Join-Path $ServerRoot $folder
+      if (Test-Path -LiteralPath $src) {
+        $dst = Join-Path $stagingDir $folder
+        & robocopy $src $dst /E /XJ /R:1 /W:1 /XF session.lock /NFL /NDL /NJH /NJS /NC /NS | Out-Null
+        if ($LASTEXITCODE -ge 8) {
+          throw "robocopy failed for $folder with exit code $LASTEXITCODE"
+        }
+      }
+    }
+
+    foreach ($rel in $filesToCopy) {
+      $src = Join-Path $ServerRoot $rel
+      if (Test-Path -LiteralPath $src) {
+        $dst = Join-Path $stagingDir $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
+        Copy-Item -LiteralPath $src -Destination $dst -Force
+      }
+    }
+  } finally {
+    if ($serverRunning) {
+      $saveOnOk = $false
+      for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+          & $mcCmd -Command 'save-on' -TimeoutMs 30000 | Out-Null
+          $saveOnOk = $true
+          break
+        } catch {
+          Write-BackupLog "WARNING: Attempt $attempt to re-enable saving via RCON failed: $_"
+          Start-Sleep -Seconds 2
+        }
+      }
+      if (-not $saveOnOk) {
+        Write-BackupLog "CRITICAL: Failed to re-enable saving (save-on) after 3 attempts!"
       }
     }
   }
 
-  $filesToCopy = @(
-    'server.properties',
-    'purpur.yml',
-    'bukkit.yml',
-    'spigot.yml',
-    'plugins\MYTownGatekeeper\accounts.yml',
-    'plugins\MYTownGatekeeper\config.yml',
-    'plugins\playit-gg\config.yml'
-  )
-  foreach ($rel in $filesToCopy) {
-    $src = Join-Path $ServerRoot $rel
-    if (Test-Path $src) {
-      $dst = Join-Path $stagingDir $rel
-      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
-      Copy-Item -Path $src -Destination $dst -Force
-    }
-  }
+  Write-BackupLog "Compressing staging directory to $zipPath"
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+  [System.IO.Compression.ZipFile]::CreateFromDirectory($stagingDir, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
 } finally {
-  if ($serverRunning) {
-    try {
-      & $mcCmd -Command 'save-on' | Out-Null
-    } catch {
-      Write-BackupLog "WARNING: Failed to re-enable saving via RCON: $_"
-    }
+  if (Test-Path -LiteralPath $stagingDir) {
+    Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
-
-Write-BackupLog "Compressing staging directory to $zipPath"
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-[System.IO.Compression.ZipFile]::CreateFromDirectory($stagingDir, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
-Remove-Item -Recurse -Force $stagingDir
 
 $sizeMB = [Math]::Round((Get-Item $zipPath).Length / 1MB, 2)
 Write-BackupLog "Archive created: $zipPath ($sizeMB MB). Uploading to $RemoteTarget..."

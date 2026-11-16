@@ -13,7 +13,7 @@ settings:
   allow-end: true
   warn-on-overload: true
   permissions-file: permissions.yml
-  update-folder: update
+  update-folder: ""
   plugin-profiling: false
   connection-throttle: 4000
   query-plugins: true

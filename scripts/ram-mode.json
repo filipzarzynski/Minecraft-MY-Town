@@ -1,5 +1,6 @@
 {
   "Mode": "Prealloc",
+  "ServerJar": "",
   "ActiveProcessorCount": 3,
   "AffinityMask": 56,
   "PriorityClass": "BelowNormal",

@@ -22,11 +22,10 @@ function Resolve-JdkBin {
 }
 
 function New-SecretString([int]$Length, [string]$Charset) {
-  $bytes = New-Object byte[] $Length
-  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
   $sb = New-Object System.Text.StringBuilder
   for ($i = 0; $i -lt $Length; $i++) {
-    [void]$sb.Append($Charset[$bytes[$i] % $Charset.Length])
+    $idx = [System.Security.Cryptography.RandomNumberGenerator]::GetInt32(0, $Charset.Length)
+    [void]$sb.Append($Charset[$idx])
   }
   return $sb.ToString()
 }
@@ -35,6 +34,14 @@ function Test-NeedsSecret([string]$Path) {
   if (-not (Test-Path $Path)) { return $true }
   $val = (Get-Content -Path $Path -Raw).Trim()
   return ([string]::IsNullOrWhiteSpace($val) -or $val -like 'CHANGE-ME*')
+}
+
+function Get-SafeFileName([string]$RawName) {
+  $leaf = [System.IO.Path]::GetFileName($RawName)
+  if ([string]::IsNullOrWhiteSpace($leaf) -or $leaf -ne $RawName -or $leaf -eq '.' -or $leaf -eq '..') {
+    throw "Unsafe remote filename rejected: '$RawName'"
+  }
+  return $leaf
 }
 
 foreach ($d in @('admin', 'backups', 'logs', 'plugins', 'scripts')) {
@@ -65,43 +72,74 @@ if ($InviteCode -or (Test-NeedsSecret $inviteFile)) {
   Write-Host "Set server invite code at $inviteFile"
 }
 
-# 2. Download third-party jars from official APIs if requested
+# 2. Download third-party jars from official APIs with cryptographic verification
 if ($DownloadDeps) {
   Write-Host "Downloading Purpur 26.3 and third-party plugins from official APIs..."
   $purpurInfo = Invoke-RestMethod 'https://api.purpurmc.org/v2/purpur/26.3'
-  $build = $purpurInfo.builds.latest
-  $purpurJarPath = Join-Path $ServerRoot "purpur-26.3-$build.jar"
-  if (-not (Test-Path $purpurJarPath)) {
+  $build = [string]$purpurInfo.builds.latest
+  $buildMeta = Invoke-RestMethod "https://api.purpurmc.org/v2/purpur/26.3/$build"
+  $purpurFileName = Get-SafeFileName "purpur-26.3-$build.jar"
+  $purpurJarPath = Join-Path $ServerRoot $purpurFileName
+  if (-not (Test-Path -LiteralPath $purpurJarPath)) {
     Invoke-WebRequest -Uri "https://api.purpurmc.org/v2/purpur/26.3/$build/download" -OutFile $purpurJarPath
-    Write-Host "Downloaded $purpurJarPath"
+    if (-not $buildMeta.md5) { throw "Missing MD5 hash in Purpur API response." }
+    $actualMd5 = (Get-FileHash -Path $purpurJarPath -Algorithm MD5).Hash.ToLowerInvariant()
+    if ($actualMd5 -ne $buildMeta.md5.ToLowerInvariant()) {
+      Remove-Item -LiteralPath $purpurJarPath -Force -ErrorAction SilentlyContinue
+      throw "MD5 verification failed for $purpurFileName"
+    }
+    Write-Host "Downloaded & MD5 verified: $purpurJarPath"
   }
 
   $playitRel = Invoke-RestMethod 'https://api.github.com/repos/playit-cloud/playit-minecraft-plugin/releases/latest'
   $playitAsset = $playitRel.assets | Where-Object { $_.name -like '*.jar' } | Select-Object -First 1
   if ($playitAsset) {
-    $playitOut = Join-Path $ServerRoot "plugins\$($playitAsset.name)"
+    $safePlayitName = Get-SafeFileName $playitAsset.name
+    $playitOut = Join-Path $ServerRoot "plugins\$safePlayitName"
     Invoke-WebRequest -Uri $playitAsset.browser_download_url -OutFile $playitOut
-    Write-Host "Downloaded $playitOut"
+    if (-not $playitAsset.digest -or $playitAsset.digest -notmatch '^sha256:([a-fA-F0-9]{64})$') {
+      Remove-Item -LiteralPath $playitOut -Force -ErrorAction SilentlyContinue
+      throw "Missing SHA-256 digest in GitHub release metadata for $safePlayitName"
+    }
+    $expectedSha256 = $Matches[1].ToLowerInvariant()
+    $actualSha256 = (Get-FileHash -Path $playitOut -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualSha256 -ne $expectedSha256) {
+      Remove-Item -LiteralPath $playitOut -Force -ErrorAction SilentlyContinue
+      throw "SHA-256 verification failed for $safePlayitName"
+    }
+    Write-Host "Downloaded & SHA-256 verified: $playitOut"
   }
 
   foreach ($slug in @('chunky', 'purpurextras')) {
     $vers = Invoke-RestMethod "https://api.modrinth.com/v2/project/$slug/version?loaders=%5B%22paper%22%5D"
     $v = $vers | Select-Object -First 1
     $f = $v.files | Select-Object -First 1
-    $outFile = Join-Path $ServerRoot "plugins\$($f.filename)"
+    $safeModName = Get-SafeFileName $f.filename
+    $outFile = Join-Path $ServerRoot "plugins\$safeModName"
     Invoke-WebRequest -Uri $f.url -OutFile $outFile
     $actual = (Get-FileHash -Path $outFile -Algorithm SHA512).Hash.ToLowerInvariant()
     if ($actual -ne $f.hashes.sha512.ToLowerInvariant()) {
-      throw "SHA-512 verification failed for $($f.filename)"
+      Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+      throw "SHA-512 verification failed for $safeModName"
     }
     Write-Host "Downloaded & SHA-512 verified: $outFile"
   }
 }
 
-# 3. Unpack Purpur server libraries via Paperclip patchonly
+# 3. Pin ServerJar in scripts\ram-mode.json and unpack Purpur server libraries via Paperclip patchonly
 $purpurJar = Get-ChildItem -Path $ServerRoot -Filter 'purpur-*.jar' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $purpurJar) {
   throw "No purpur-*.jar found in $ServerRoot. Place Purpur 26.3 jar there or pass -DownloadDeps."
+}
+
+$ramModePath = Join-Path $ServerRoot 'scripts\ram-mode.json'
+if (Test-Path -LiteralPath $ramModePath) {
+  $ramCfg = Get-Content -Path $ramModePath -Raw | ConvertFrom-Json
+  if ([string]::IsNullOrWhiteSpace($ramCfg.ServerJar)) {
+    $ramCfg.ServerJar = $purpurJar.Name
+    $ramCfg | ConvertTo-Json -Depth 4 | Set-Content -Path $ramModePath -Encoding UTF8
+    Write-Host "Pinned ServerJar='$($purpurJar.Name)' in $ramModePath"
+  }
 }
 
 $jdkBin = Resolve-JdkBin
@@ -121,13 +159,14 @@ if (-not (Test-Path (Join-Path $ServerRoot 'libraries\com\mojang\brigadier'))) {
 & (Join-Path $PSScriptRoot 'build-gatekeeper.ps1') -ServerRoot $ServerRoot
 
 $inviteVal = (Get-Content -Path $inviteFile -Raw).Trim()
+$yamlSafeInvite = $inviteVal.Replace('\', '\\').Replace('"', '\"')
 $gkDir = Join-Path $ServerRoot 'plugins\MYTownGatekeeper'
 New-Item -ItemType Directory -Force -Path $gkDir | Out-Null
 $gkConfig = Join-Path $gkDir 'config.yml'
 if (-not (Test-Path $gkConfig)) {
   $cfgText = @"
 # MYTownGatekeeper configuration
-invite-code: "$inviteVal"
+invite-code: "$yamlSafeInvite"
 session-ttl-hours: 24
 auth-timeout-seconds: 90
 min-password-length: 6
@@ -139,7 +178,7 @@ lockout-minutes: 15
 } else {
   $gkText = Get-Content -Path $gkConfig -Raw
   if ($gkText -match 'invite-code:\s*"?CHANGE-ME[^"\r\n]*"?' -or $InviteCode) {
-    $gkText = [regex]::Replace($gkText, 'invite-code:\s*"?[^"\r\n]*"?', "invite-code: `"$inviteVal`"")
+    $gkText = [regex]::Replace($gkText, 'invite-code:\s*"?[^"\r\n]*"?', { param($m) "invite-code: `"$yamlSafeInvite`"" })
     [System.IO.File]::WriteAllText($gkConfig, $gkText, (New-Object System.Text.UTF8Encoding $false))
     Write-Host "Synced invite code into $gkConfig"
   }
@@ -153,11 +192,11 @@ if (Test-Path $propsDest) {
   $propsText = Get-Content -Path $propsDest -Raw
   $changed = $false
   if ($propsText -match 'rcon\.password=CHANGE-ME[^\r\n]*') {
-    $propsText = [regex]::Replace($propsText, 'rcon\.password=CHANGE-ME[^\r\n]*', "rcon.password=$rconSecret")
+    $propsText = [regex]::Replace($propsText, 'rcon\.password=CHANGE-ME[^\r\n]*', { param($m) "rcon.password=$rconSecret" })
     $changed = $true
   }
   if ($propsText -match 'management-server-secret=CHANGE-ME[^\r\n]*') {
-    $propsText = [regex]::Replace($propsText, 'management-server-secret=CHANGE-ME[^\r\n]*', "management-server-secret=$mgmtSecret")
+    $propsText = [regex]::Replace($propsText, 'management-server-secret=CHANGE-ME[^\r\n]*', { param($m) "management-server-secret=$mgmtSecret" })
     $changed = $true
   }
   if ($changed) {
@@ -176,6 +215,22 @@ if (-not $eulaAccepted) {
   }
   [System.IO.File]::WriteAllText($eulaPath, "# Accepted via bootstrap-server.ps1 (https://aka.ms/MinecraftEULA)`r`neula=true`r`n", (New-Object System.Text.UTF8Encoding $false))
   Write-Host "Accepted EULA in $eulaPath (eula=true)"
+}
+
+# 7. Protect cloned Git working tree against accidentally committing live local secrets
+if ((Test-Path -LiteralPath (Join-Path $ServerRoot '.git')) -and (Get-Command git -ErrorAction SilentlyContinue)) {
+  $secretFiles = @(
+    'admin/mcserver-password.txt', 'admin/rcon-secret.txt', 'admin/invite-code.txt',
+    'admin/rclone.conf', 'server.properties', 'eula.txt',
+    'plugins/MYTownGatekeeper/config.yml', 'plugins/MYTownGatekeeper/accounts.yml',
+    'plugins/playit-gg/config.yml', 'scripts/ram-mode.json'
+  )
+  foreach ($sf in $secretFiles) {
+    if (Test-Path -LiteralPath (Join-Path $ServerRoot $sf)) {
+      & git -C $ServerRoot update-index --skip-worktree -- $sf 2>$null
+    }
+  }
+  Write-Host "Marked local secret/config files with git --skip-worktree."
 }
 
 Write-Host ""

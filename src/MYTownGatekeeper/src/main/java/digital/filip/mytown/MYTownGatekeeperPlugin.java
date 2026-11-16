@@ -32,6 +32,8 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import javax.crypto.SecretKeyFactory;
@@ -52,6 +54,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -79,15 +82,19 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
     private static final int PBKDF2_KEY_BITS = 256;
     private static final int SALT_BYTES = 16;
     private static final int MAX_CONCURRENT_AUTH = 16;
+    private static final int MAX_CONCURRENT_AUTH_PER_IP = 2;
     private static final int MAX_LOCKOUT_ENTRIES = 4096;
+    private static final int MAX_INVITE_LENGTH = 128;
+    private static final long POST_AUTH_SPAWN_TTL_MS = 30_000L;
 
     private final SecureRandom secureRandom = new SecureRandom();
     private final Object stateLock = new Object();
     private final Semaphore pbkdf2Semaphore = new Semaphore(2);
 
-    private final ConcurrentHashMap<PlayerCommonConnection, CompletableFuture<DialogSubmission>> pendingAuth =
+    private final ConcurrentHashMap<PlayerCommonConnection, AuthSession> pendingAuth =
         new ConcurrentHashMap<>();
     private final Set<String> activeConfiguringUsers = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<String, Long> postAuthSpawningUsers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AccountRecord> accounts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, LockoutState> ipLockouts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, LockoutState> userLockouts = new ConcurrentHashMap<>();
@@ -117,10 +124,12 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
 
     @Override
     public void onDisable() {
-        for (Map.Entry<PlayerCommonConnection, CompletableFuture<DialogSubmission>> entry : pendingAuth.entrySet()) {
-            entry.getValue().complete(DialogSubmission.abortedResult());
+        for (AuthSession session : pendingAuth.values()) {
+            session.future.complete(DialogSubmission.abortedResult());
         }
         pendingAuth.clear();
+        activeConfiguringUsers.clear();
+        postAuthSpawningUsers.clear();
         saveAccounts();
     }
 
@@ -137,8 +146,8 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
             long lockMins = Math.max(1L, getConfig().getLong("lockout-minutes", 15L));
             this.lockoutSeconds = lockMins * 60L;
 
-            if ("CHANGE-ME".equals(this.inviteCode) || this.inviteCode.isEmpty()) {
-                getLogger().warning("invite-code is set to default placeholder! Rotate it immediately with /gatekeeper setinvite <code>.");
+            if ("CHANGE-ME".equals(this.inviteCode) || this.inviteCode.isEmpty() || this.inviteCode.startsWith("CHANGE-ME-")) {
+                getLogger().warning("invite-code is set to a placeholder! Rotate it immediately with /gatekeeper setinvite <code>.");
             }
         }
     }
@@ -216,65 +225,81 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
         );
     }
 
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        postAuthSpawningUsers.remove(event.getPlayer().getName().toLowerCase(Locale.ROOT));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        postAuthSpawningUsers.remove(event.getPlayer().getName().toLowerCase(Locale.ROOT));
+    }
+
     /**
-     * Early handshake lockout, capacity, and anti-spoofing check before Purpur can
-     * kick an already-online player during login setup.
+     * Initial login handshake gate only (ignores post-configuration revalidation).
      */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onValidateLogin(PlayerConnectionValidateLoginEvent event) {
         if (!event.isAllowed()) {
             return;
         }
-        String ip = extractIp(event.getConnection());
-        long remainingSec = getLockoutRemainingSeconds(ipLockouts, ip);
-        if (remainingSec > 0) {
+        if (!(event.getConnection() instanceof PlayerLoginConnection loginConn)) {
+            return;
+        }
+
+        String ip = extractIp(loginConn);
+        long ipLockSec = getLockoutRemainingSeconds(ipLockouts, ip);
+        if (ipLockSec > 0) {
             event.kickMessage(Component.text(
                 "Too many failed authentication attempts from your IP. Try again in "
-                    + formatDuration(remainingSec) + ".",
+                    + formatDuration(ipLockSec) + ".",
                 NamedTextColor.RED
             ));
             return;
         }
 
-        if (pendingAuth.size() >= MAX_CONCURRENT_AUTH) {
+        PlayerProfile profile = loginConn.getAuthenticatedProfile();
+        if (profile == null) {
+            profile = loginConn.getUnsafeProfile();
+        }
+        String rawName = profile != null ? profile.getName() : null;
+        if (rawName == null || !VALID_USERNAME.matcher(rawName).matches()) {
+            event.kickMessage(Component.text("Invalid Minecraft username.", NamedTextColor.RED));
+            return;
+        }
+
+        String userKey = rawName.toLowerCase(Locale.ROOT);
+        if (isPlayerOnlineOrTransitioning(rawName, userKey)) {
+            getLogger().warning("Rejected duplicate unauthenticated login for active user '" + rawName + "' from " + ip + ".");
+            event.kickMessage(Component.text("That player is already logged in.", NamedTextColor.RED));
+            return;
+        }
+
+        // Allow returning players on valid non-expired IP sessions to proceed even if dialog queue is busy
+        if (hasValidIpSession(userKey, ip)) {
+            return;
+        }
+
+        long pairLockSec = getLockoutRemainingSeconds(userLockouts, pairKey(ip, userKey));
+        if (pairLockSec > 0) {
             event.kickMessage(Component.text(
-                "Server authentication queue is busy. Please retry in a few seconds.",
-                NamedTextColor.YELLOW
+                "Authentication temporarily locked for this account from your IP. Try again in "
+                    + formatDuration(pairLockSec) + ".",
+                NamedTextColor.RED
             ));
             return;
         }
 
-        if (event.getConnection() instanceof PlayerLoginConnection loginConn) {
-            PlayerProfile profile = loginConn.getAuthenticatedProfile();
-            if (profile == null) {
-                profile = loginConn.getUnsafeProfile();
-            }
-            String rawName = profile != null ? profile.getName() : null;
-            if (rawName == null || !VALID_USERNAME.matcher(rawName).matches()) {
-                event.kickMessage(Component.text("Invalid Minecraft username.", NamedTextColor.RED));
-                return;
-            }
-            String userKey = rawName.toLowerCase(Locale.ROOT);
-            long userLockSec = getLockoutRemainingSeconds(userLockouts, userKey);
-            if (userLockSec > 0) {
-                event.kickMessage(Component.text(
-                    "Authentication temporarily locked for this account. Try again in " + formatDuration(userLockSec) + ".",
-                    NamedTextColor.RED
-                ));
-                return;
-            }
-            if (isPlayerCurrentlyOnline(rawName) || activeConfiguringUsers.contains(userKey)) {
-                getLogger().warning("Rejected duplicate unauthenticated login for online/active user '" + rawName + "' from " + ip + ".");
-                event.kickMessage(Component.text(
-                    "That player is already logged in.",
-                    NamedTextColor.RED
-                ));
-            }
+        if (pendingAuth.size() >= MAX_CONCURRENT_AUTH || countPendingForIp(ip) >= MAX_CONCURRENT_AUTH_PER_IP) {
+            event.kickMessage(Component.text(
+                "Server authentication queue is busy. Please retry in a few seconds.",
+                NamedTextColor.YELLOW
+            ));
         }
     }
 
     /**
-     * Configuration-phase pre-world authentication gate.
+     * Configuration-phase pre-world authentication gate (fail-closed).
      */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPlayerConfigure(AsyncPlayerConnectionConfigureEvent event) {
@@ -288,43 +313,38 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
         String userKey = rawUsername.toLowerCase(Locale.ROOT);
         String ip = extractIp(conn);
 
-        if (isPlayerCurrentlyOnline(rawUsername) || !activeConfiguringUsers.add(userKey)) {
+        if (isPlayerOnlineOrTransitioning(rawUsername, userKey) || !activeConfiguringUsers.add(userKey)) {
             conn.disconnect(Component.text("That player is already logged in or authenticating.", NamedTextColor.RED));
             return;
         }
 
+        boolean authenticated = false;
         try {
-            long lockSec = Math.max(
-                getLockoutRemainingSeconds(ipLockouts, ip),
-                getLockoutRemainingSeconds(userLockouts, userKey)
-            );
-            if (lockSec > 0) {
+            long ipLockSec = getLockoutRemainingSeconds(ipLockouts, ip);
+            if (ipLockSec > 0) {
                 conn.disconnect(Component.text(
-                    "Authentication temporarily locked. Try again in " + formatDuration(lockSec) + ".",
+                    "Authentication temporarily locked from your IP. Try again in " + formatDuration(ipLockSec) + ".",
                     NamedTextColor.RED
                 ));
                 return;
             }
 
-            AccountRecord existing = accounts.get(userKey);
-            long now = Instant.now().getEpochSecond();
-
-            if (existing != null && sessionTtlSeconds > 0
-                && !ip.isEmpty() && ip.equals(existing.lastIp)
-                && (now - existing.lastLoginEpochSec) <= sessionTtlSeconds
-                && !isPlayerCurrentlyOnline(rawUsername)) {
-                AccountRecord updated = existing.withLogin(ip, now);
-                accounts.put(userKey, updated);
-                saveAccounts();
+            // Absolute 24h IP session check (do not extend lastLoginEpochSec without password entry)
+            if (hasValidIpSession(userKey, ip)) {
+                markAuthenticated(userKey);
+                authenticated = true;
                 getLogger().info("Resumed IP session for " + rawUsername + " (" + ip + ").");
                 return;
             }
 
+            final String scopedPairKey = pairKey(ip, userKey);
+            final long connectionDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(authTimeoutSeconds);
             String errorBanner = null;
+
             while (conn.isConnected()) {
                 long currentLock = Math.max(
                     getLockoutRemainingSeconds(ipLockouts, ip),
-                    getLockoutRemainingSeconds(userLockouts, userKey)
+                    getLockoutRemainingSeconds(userLockouts, scopedPairKey)
                 );
                 if (currentLock > 0) {
                     conn.disconnect(Component.text(
@@ -334,7 +354,12 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
                     return;
                 }
 
-                if (pendingAuth.size() >= MAX_CONCURRENT_AUTH) {
+                if (System.nanoTime() >= connectionDeadlineNanos) {
+                    conn.disconnect(Component.text("Authentication timed out. Please reconnect.", NamedTextColor.RED));
+                    return;
+                }
+
+                if (pendingAuth.size() >= MAX_CONCURRENT_AUTH || countPendingForIp(ip) >= MAX_CONCURRENT_AUTH_PER_IP) {
                     conn.disconnect(Component.text(
                         "Server authentication queue is busy. Please retry in a few seconds.",
                         NamedTextColor.YELLOW
@@ -342,21 +367,22 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
                     return;
                 }
 
-                existing = accounts.get(userKey);
+                AccountRecord existing = accounts.get(userKey);
                 boolean isRegistration = (existing == null);
 
                 Dialog dialog = isRegistration
                     ? buildRegistrationDialog(rawUsername, errorBanner)
-                    : buildLoginDialog(rawUsername, errorBanner, remainingAttempts(ip, userKey));
+                    : buildLoginDialog(rawUsername, errorBanner, remainingAttempts(ip, scopedPairKey));
 
                 CompletableFuture<DialogSubmission> future = new CompletableFuture<>();
-                pendingAuth.put(conn, future);
+                AuthSession session = new AuthSession(future, ip, userKey, conn);
+                pendingAuth.put(conn, session);
                 DialogSubmission submission;
                 try {
                     conn.getAudience().showDialog(dialog);
-                    submission = awaitSubmission(conn, future);
+                    submission = awaitSubmission(conn, future, connectionDeadlineNanos);
                 } finally {
-                    pendingAuth.remove(conn, future);
+                    pendingAuth.remove(conn, session);
                 }
 
                 if (submission == null) {
@@ -377,8 +403,9 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
                     String pwd = submission.password == null ? "" : submission.password;
                     String pwdConfirm = submission.passwordConfirm == null ? "" : submission.passwordConfirm;
 
-                    if (!constantTimeEquals(enteredInvite, this.inviteCode)) {
-                        int left = recordFailure(ip, userKey);
+                    if (enteredInvite.isEmpty() || enteredInvite.length() > MAX_INVITE_LENGTH
+                        || !constantTimeEquals(enteredInvite, this.inviteCode)) {
+                        int left = recordFailure(ip, scopedPairKey);
                         getLogger().warning("Failed invite attempt for " + rawUsername + " from " + ip + " (" + left + " left)");
                         if (left <= 0) {
                             conn.disconnect(Component.text("Too many failed invite attempts. Try again later.", NamedTextColor.RED));
@@ -400,36 +427,64 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
                     AccountRecord created;
                     try {
                         created = createAccountRecord(rawUsername, pwd, ip);
-                    } catch (IllegalStateException busyEx) {
+                    } catch (IllegalArgumentException | IllegalStateException ex) {
                         conn.disconnect(Component.text("Authentication service busy. Please retry.", NamedTextColor.YELLOW));
                         return;
                     }
+
                     AccountRecord race = accounts.putIfAbsent(userKey, created);
                     if (race != null) {
                         errorBanner = "Account already exists. Please log in with your password.";
                         continue;
                     }
-                    clearFailures(ip, userKey);
+                    clearFailures(ip, scopedPairKey);
                     saveAccounts();
+                    markAuthenticated(userKey);
+                    authenticated = true;
                     getLogger().info("Registered new account " + rawUsername + " from " + ip + ".");
                     return;
                 } else {
                     String pwd = submission.password == null ? "" : submission.password;
+                    if (pwd.isEmpty() || pwd.length() > maxPasswordLength) {
+                        int left = recordFailure(ip, scopedPairKey);
+                        if (left <= 0) {
+                            conn.disconnect(Component.text("Too many failed password attempts. Try again later.", NamedTextColor.RED));
+                            return;
+                        }
+                        errorBanner = "Password must be 1-" + maxPasswordLength + " characters (" + left + " attempts remaining).";
+                        continue;
+                    }
+
                     boolean validPwd;
                     try {
                         validPwd = verifyPassword(pwd, existing);
+                    } catch (IllegalArgumentException ex) {
+                        getLogger().warning("Malformed password hash/salt for " + rawUsername + "; failing closed.");
+                        conn.disconnect(Component.text("Account credential error. Contact server admin.", NamedTextColor.RED));
+                        return;
                     } catch (IllegalStateException busyEx) {
                         conn.disconnect(Component.text("Authentication service busy. Please retry.", NamedTextColor.YELLOW));
                         return;
                     }
+
                     if (validPwd) {
-                        accounts.put(userKey, existing.withLogin(ip, Instant.now().getEpochSecond()));
-                        clearFailures(ip, userKey);
+                        AccountRecord updated = accounts.computeIfPresent(
+                            userKey,
+                            (k, cur) -> cur.withLogin(ip, Instant.now().getEpochSecond())
+                        );
+                        if (updated == null) {
+                            errorBanner = "Your account was reset. Please re-register with the invite code.";
+                            continue;
+                        }
+                        clearFailures(ip, scopedPairKey);
                         saveAccounts();
+                        markAuthenticated(userKey);
+                        authenticated = true;
                         getLogger().info("Authenticated " + rawUsername + " from " + ip + ".");
                         return;
                     }
-                    int left = recordFailure(ip, userKey);
+
+                    int left = recordFailure(ip, scopedPairKey);
                     getLogger().warning("Failed password login for " + rawUsername + " from " + ip + " (" + left + " left)");
                     if (left <= 0) {
                         conn.disconnect(Component.text("Too many failed password attempts. Try again later.", NamedTextColor.RED));
@@ -440,6 +495,15 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
             }
         } finally {
             activeConfiguringUsers.remove(userKey);
+            if (!authenticated) {
+                postAuthSpawningUsers.remove(userKey);
+                try {
+                    if (conn.isConnected()) {
+                        conn.disconnect(Component.text("Authentication incomplete.", NamedTextColor.RED));
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
         }
     }
 
@@ -449,31 +513,34 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
         if (!"mytowngatekeeper".equals(id.namespace())) {
             return;
         }
-        CompletableFuture<DialogSubmission> future = pendingAuth.get(event.getCommonConnection());
-        if (future == null) {
+        AuthSession session = pendingAuth.get(event.getCommonConnection());
+        if (session == null) {
             return;
         }
         if (ACTION_ABORT.equals(id)) {
-            future.complete(DialogSubmission.abortedResult());
+            session.future.complete(DialogSubmission.abortedResult());
             return;
         }
         if (ACTION_SUBMIT.equals(id)) {
             DialogResponseView view = event.getDialogResponseView();
             if (view == null) {
-                future.complete(DialogSubmission.abortedResult());
+                session.future.complete(DialogSubmission.abortedResult());
                 return;
             }
             String invite = view.getText("invite_code");
             String pass = view.getText("password");
             String passConfirm = view.getText("password_confirm");
-            future.complete(new DialogSubmission(false, invite, pass, passConfirm));
+            session.future.complete(new DialogSubmission(false, invite, pass, passConfirm));
         }
     }
 
-    private DialogSubmission awaitSubmission(PlayerConfigurationConnection conn, CompletableFuture<DialogSubmission> future) {
-        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(authTimeoutSeconds);
+    private DialogSubmission awaitSubmission(
+        PlayerConfigurationConnection conn,
+        CompletableFuture<DialogSubmission> future,
+        long connectionDeadlineNanos
+    ) {
         while (conn.isConnected()) {
-            long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+            long remainingMs = TimeUnit.NANOSECONDS.toMillis(connectionDeadlineNanos - System.nanoTime());
             if (remainingMs <= 0) {
                 return null;
             }
@@ -481,7 +548,7 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
             try {
                 return future.get(stepMs, TimeUnit.MILLISECONDS);
             } catch (TimeoutException ignored) {
-                // Keep polling connection health until authTimeoutSeconds expires.
+                // Keep checking connection liveness until connectionDeadlineNanos expires.
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
                 return null;
@@ -511,7 +578,7 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
                 .inputs(List.of(
                     DialogInput.text("invite_code", Component.text("Server Invite Code", NamedTextColor.AQUA))
                         .width(260)
-                        .maxLength(128)
+                        .maxLength(MAX_INVITE_LENGTH)
                         .build(),
                     DialogInput.text("password", Component.text("Create Personal Password (min " + minPasswordLength + " chars)", NamedTextColor.GREEN))
                         .width(260)
@@ -592,6 +659,9 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
     private boolean verifyPassword(String password, AccountRecord record) {
         byte[] salt = Base64.getDecoder().decode(record.saltBase64);
         byte[] expectedHash = Base64.getDecoder().decode(record.hashBase64);
+        if (salt.length == 0 || expectedHash.length == 0) {
+            throw new IllegalArgumentException("Empty salt or hash in account store");
+        }
         byte[] actualHash = pbkdf2(password, salt);
         return MessageDigest.isEqual(expectedHash, actualHash);
     }
@@ -632,6 +702,58 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
         return inet != null ? inet.getHostAddress() : addr.getHostString();
     }
 
+    private static String pairKey(String ip, String userKey) {
+        return (ip == null ? "" : ip) + "|" + userKey;
+    }
+
+    private boolean hasValidIpSession(String userKey, String ip) {
+        if (sessionTtlSeconds <= 0 || ip == null || ip.isEmpty()) {
+            return false;
+        }
+        AccountRecord existing = accounts.get(userKey);
+        if (existing == null || existing.lastLoginEpochSec <= 0) {
+            return false;
+        }
+        long now = Instant.now().getEpochSecond();
+        return ip.equals(existing.lastIp) && (now - existing.lastLoginEpochSec) <= sessionTtlSeconds;
+    }
+
+    private void markAuthenticated(String userKey) {
+        postAuthSpawningUsers.put(userKey, System.currentTimeMillis() + POST_AUTH_SPAWN_TTL_MS);
+    }
+
+    private boolean isPostAuthSpawning(String userKey) {
+        Long expiresAt = postAuthSpawningUsers.get(userKey);
+        if (expiresAt == null) {
+            return false;
+        }
+        if (expiresAt <= System.currentTimeMillis()) {
+            postAuthSpawningUsers.remove(userKey, expiresAt);
+            return false;
+        }
+        return true;
+    }
+
+    private boolean isPlayerOnlineOrTransitioning(String username, String userKey) {
+        if (isPlayerCurrentlyOnline(username) || isPostAuthSpawning(userKey)) {
+            return true;
+        }
+        return false;
+    }
+
+    private int countPendingForIp(String ip) {
+        if (ip == null || ip.isEmpty()) {
+            return 0;
+        }
+        int count = 0;
+        for (AuthSession session : pendingAuth.values()) {
+            if (ip.equals(session.ip)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     private static boolean isPlayerCurrentlyOnline(String username) {
         for (Player p : Bukkit.getOnlinePlayers()) {
             if (p.getName().equalsIgnoreCase(username)) {
@@ -641,16 +763,16 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
         return false;
     }
 
-    private int remainingAttempts(String ip, String userKey) {
+    private int remainingAttempts(String ip, String scopedPairKey) {
         int ipFails = getFailureCount(ipLockouts, ip);
-        int userFails = getFailureCount(userLockouts, userKey);
-        return Math.max(0, maxFailedAttempts - Math.max(ipFails, userFails));
+        int pairFails = getFailureCount(userLockouts, scopedPairKey);
+        return Math.max(0, maxFailedAttempts - Math.max(ipFails, pairFails));
     }
 
-    private int recordFailure(String ip, String userKey) {
+    private int recordFailure(String ip, String scopedPairKey) {
         int ipLeft = incrementFailure(ipLockouts, ip);
-        int userLeft = incrementFailure(userLockouts, userKey);
-        return Math.min(ipLeft, userLeft);
+        int pairLeft = incrementFailure(userLockouts, scopedPairKey);
+        return Math.min(ipLeft, pairLeft);
     }
 
     private int incrementFailure(ConcurrentHashMap<String, LockoutState> map, String key) {
@@ -662,23 +784,35 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
             pruneExpiredLockouts(map, now);
         }
         if (!map.containsKey(key) && map.size() >= MAX_LOCKOUT_ENTRIES) {
-            return 0;
+            evictOldestLockout(map);
         }
         LockoutState updated = map.compute(key, (k, cur) -> {
-            if (cur == null || (cur.lockedUntilEpochSec > 0 && cur.lockedUntilEpochSec <= now)) {
+            if (cur == null
+                || (cur.lockedUntilEpochSec > 0 && cur.lockedUntilEpochSec <= now)
+                || (cur.lockedUntilEpochSec == 0 && (now - cur.lastFailureEpochSec) >= lockoutSeconds)) {
                 int fails = 1;
                 long lockUntil = fails >= maxFailedAttempts ? now + lockoutSeconds : 0L;
-                return new LockoutState(fails, lockUntil);
+                return new LockoutState(fails, lockUntil, now);
             }
             int fails = cur.failures + 1;
             long lockUntil = fails >= maxFailedAttempts ? now + lockoutSeconds : cur.lockedUntilEpochSec;
-            return new LockoutState(fails, lockUntil);
+            return new LockoutState(fails, lockUntil, now);
         });
         return Math.max(0, maxFailedAttempts - updated.failures);
     }
 
-    private static void pruneExpiredLockouts(ConcurrentHashMap<String, LockoutState> map, long now) {
-        map.entrySet().removeIf(e -> e.getValue().lockedUntilEpochSec > 0 && e.getValue().lockedUntilEpochSec <= now);
+    private void pruneExpiredLockouts(ConcurrentHashMap<String, LockoutState> map, long now) {
+        map.entrySet().removeIf(e -> {
+            LockoutState s = e.getValue();
+            return (s.lockedUntilEpochSec > 0 && s.lockedUntilEpochSec <= now)
+                || (s.lockedUntilEpochSec == 0 && (now - s.lastFailureEpochSec) >= lockoutSeconds);
+        });
+    }
+
+    private static void evictOldestLockout(ConcurrentHashMap<String, LockoutState> map) {
+        map.entrySet().stream()
+            .min(Comparator.comparingLong(e -> e.getValue().lastFailureEpochSec))
+            .ifPresent(oldest -> map.remove(oldest.getKey(), oldest.getValue()));
     }
 
     private int getFailureCount(ConcurrentHashMap<String, LockoutState> map, String key) {
@@ -690,7 +824,8 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
             return 0;
         }
         long now = Instant.now().getEpochSecond();
-        if (state.lockedUntilEpochSec > 0 && state.lockedUntilEpochSec <= now) {
+        if ((state.lockedUntilEpochSec > 0 && state.lockedUntilEpochSec <= now)
+            || (state.lockedUntilEpochSec == 0 && (now - state.lastFailureEpochSec) >= lockoutSeconds)) {
             map.remove(key, state);
             return 0;
         }
@@ -714,12 +849,12 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
         return rem;
     }
 
-    private void clearFailures(String ip, String userKey) {
+    private void clearFailures(String ip, String scopedPairKey) {
         if (ip != null && !ip.isEmpty()) {
             ipLockouts.remove(ip);
         }
-        if (userKey != null && !userKey.isEmpty()) {
-            userLockouts.remove(userKey);
+        if (scopedPairKey != null && !scopedPairKey.isEmpty()) {
+            userLockouts.remove(scopedPairKey);
         }
     }
 
@@ -727,6 +862,14 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
         long mins = seconds / 60;
         long secs = seconds % 60;
         return mins > 0 ? (mins + "m " + secs + "s") : (secs + "s");
+    }
+
+    private record AuthSession(
+        CompletableFuture<DialogSubmission> future,
+        String ip,
+        String userKey,
+        PlayerConfigurationConnection conn
+    ) {
     }
 
     private record DialogSubmission(boolean aborted, String inviteCode, String password, String passwordConfirm) {
@@ -748,7 +891,7 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
         }
     }
 
-    private record LockoutState(int failures, long lockedUntilEpochSec) {
+    private record LockoutState(int failures, long lockedUntilEpochSec, long lastFailureEpochSec) {
     }
 
     private final class GatekeeperCommand implements BasicCommand {
@@ -773,7 +916,7 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
             }
             if (args.length == 0 || "help".equalsIgnoreCase(args[0])) {
                 sender.sendMessage(Component.text(
-                    "Gatekeeper commands: /gatekeeper status | setinvite <code> | resetpassword <user> | clearlockout <ip|user|all> | reload",
+                    "Gatekeeper commands: /gatekeeper status [reveal] | setinvite <code> | resetpassword <user> | clearlockout <ip|user|all> | reload",
                     NamedTextColor.AQUA
                 ));
                 return;
@@ -781,13 +924,17 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
 
             switch (args[0].toLowerCase(Locale.ROOT)) {
                 case "status" -> {
-                    long activeLocks = ipLockouts.values().stream().filter(s -> s.lockedUntilEpochSec > Instant.now().getEpochSecond()).count()
-                        + userLockouts.values().stream().filter(s -> s.lockedUntilEpochSec > Instant.now().getEpochSecond()).count();
+                    long now = Instant.now().getEpochSecond();
+                    long activeLocks = ipLockouts.values().stream().filter(s -> s.lockedUntilEpochSec > now).count()
+                        + userLockouts.values().stream().filter(s -> s.lockedUntilEpochSec > now).count();
+                    boolean reveal = (sender instanceof ConsoleCommandSender)
+                        || (args.length >= 2 && "reveal".equalsIgnoreCase(args[1]));
+                    String displayInvite = reveal ? inviteCode : "*** (use RCON or /gatekeeper status reveal)";
                     sender.sendMessage(Component.text(
                         "MYTownGatekeeper Status: registered=" + accounts.size()
                             + ", activeLockouts=" + activeLocks
                             + ", sessionTTLHours=" + (sessionTtlSeconds / 3600L)
-                            + ", inviteCode=" + inviteCode,
+                            + ", inviteCode=" + displayInvite,
                         NamedTextColor.GREEN
                     ));
                 }
@@ -797,8 +944,8 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
                         return;
                     }
                     String newCode = args[1].trim();
-                    if (newCode.length() < 4) {
-                        sender.sendMessage(Component.text("Invite code must be at least 4 characters.", NamedTextColor.RED));
+                    if (newCode.length() < 4 || newCode.length() > MAX_INVITE_LENGTH) {
+                        sender.sendMessage(Component.text("Invite code must be 4-" + MAX_INVITE_LENGTH + " characters.", NamedTextColor.RED));
                         return;
                     }
                     synchronized (stateLock) {
@@ -819,7 +966,13 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
                         sender.sendMessage(Component.text("No registered account found for '" + args[1] + "'.", NamedTextColor.YELLOW));
                         return;
                     }
-                    userLockouts.remove(targetKey);
+                    userLockouts.entrySet().removeIf(e -> e.getKey().endsWith("|" + targetKey));
+                    postAuthSpawningUsers.remove(targetKey);
+                    for (AuthSession s : pendingAuth.values()) {
+                        if (targetKey.equals(s.userKey)) {
+                            s.future.complete(DialogSubmission.abortedResult());
+                        }
+                    }
                     saveAccounts();
                     Player online = Bukkit.getPlayerExact(removed.displayName);
                     if (online != null && online.isOnline()) {
@@ -837,9 +990,11 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
                         userLockouts.clear();
                         sender.sendMessage(Component.text("Cleared all IP and username lockouts.", NamedTextColor.GREEN));
                     } else {
-                        ipLockouts.remove(args[1]);
-                        userLockouts.remove(args[1].toLowerCase(Locale.ROOT));
-                        sender.sendMessage(Component.text("Cleared lockout for " + args[1] + ".", NamedTextColor.GREEN));
+                        String arg = args[1];
+                        String argLower = arg.toLowerCase(Locale.ROOT);
+                        ipLockouts.remove(arg);
+                        userLockouts.entrySet().removeIf(e -> e.getKey().startsWith(arg + "|") || e.getKey().endsWith("|" + argLower));
+                        sender.sendMessage(Component.text("Cleared lockout for " + arg + ".", NamedTextColor.GREEN));
                     }
                 }
                 case "reload" -> {

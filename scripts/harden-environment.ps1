@@ -27,6 +27,19 @@ function Resolve-JavaExe {
   throw "Java binary (java.exe) not found."
 }
 
+function Assert-TreeCleanOfReparsePoints([string]$TargetRoot) {
+  $rootItem = Get-Item -LiteralPath $TargetRoot -Force -ErrorAction Stop
+  if ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+    throw "SECURITY ABORT: ReparsePoint detected on root $TargetRoot"
+  }
+  $bad = Get-ChildItem -LiteralPath $TargetRoot -Force -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint } |
+    Select-Object -First 1
+  if ($bad) {
+    throw "SECURITY ABORT: ReparsePoint (junction/symlink) detected at $($bad.FullName)"
+  }
+}
+
 $adminDir = Join-Path $ServerRoot 'admin'
 $logFile = Join-Path $adminDir 'harden-report.log'
 New-Item -ItemType Directory -Force -Path $adminDir | Out-Null
@@ -96,14 +109,14 @@ try {
     }
   }
 
-  # 3. Apply least-privilege NTFS ACLs
+  # 3. Stop running server, scan for ReparsePoints, and apply least-privilege NTFS ACLs
   Log "Step 3: Stopping running server cleanly (if online) and applying least-privilege NTFS ACLs under $ServerRoot..."
   $mcCmd = Join-Path $ServerRoot 'scripts\mc-cmd.ps1'
   $runningJava = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $javaExe -and $_.CommandLine -match [regex]::Escape($ServerRoot) }
   if ($runningJava) {
     try {
-      & $mcCmd -Command 'save-all flush' | Out-Null
-      & $mcCmd -Command 'stop' | Out-Null
+      & $mcCmd -Command 'save-all flush' -TimeoutMs 20000 | Out-Null
+      & $mcCmd -Command 'stop' -TimeoutMs 10000 | Out-Null
     } catch {
       Log "RCON stop note: $_"
     }
@@ -123,10 +136,12 @@ try {
     }
   }
 
+  Assert-TreeCleanOfReparsePoints $ServerRoot
+
   $pendingGk = Join-Path $ServerRoot 'plugins\MYTownGatekeeper.jar.pending'
   $liveGk = Join-Path $ServerRoot 'plugins\MYTownGatekeeper.jar'
-  if (Test-Path $pendingGk) {
-    Move-Item -Path $pendingGk -Destination $liveGk -Force
+  if (Test-Path -LiteralPath $pendingGk) {
+    Move-Item -LiteralPath $pendingGk -Destination $liveGk -Force
     Log "Applied staged MYTownGatekeeper.jar update."
   }
 
@@ -138,78 +153,127 @@ try {
     }
   }
 
-  # Root runtime: break inheritance from parent drive (strips Authenticated Users:(M)) and grant service account Modify
-  Invoke-Icacls @($ServerRoot, '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)M")
+  # Lock $ServerRoot itself to ReadAndExecute only (blocks dropping new server jars or tampering with root configs)
+  Invoke-Icacls @($ServerRoot, '/L', '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)RX")
 
   # Isolate parent non-system volume root so service account can traverse into $ServerRoot without accessing sibling files/folders
   $driveRoot = (Split-Path -Qualifier $ServerRoot) + '\'
   if ($driveRoot.TrimEnd('\') -ine $env:SystemDrive) {
-    Invoke-Icacls @($driveRoot, '/remove:d', $ServiceUser)
-    Invoke-Icacls @($driveRoot, '/deny', "${ServiceUser}:(OI)(CI)(IO)(F)")
-    Invoke-Icacls @($driveRoot, '/deny', "${ServiceUser}:(WD,AD,DE)")
+    Invoke-Icacls @($driveRoot, '/L', '/remove:d', $ServiceUser)
+    Invoke-Icacls @($driveRoot, '/L', '/deny', "${ServiceUser}:(OI)(CI)(IO)(F)")
+    Invoke-Icacls @($driveRoot, '/L', '/deny', "${ServiceUser}:(RD,WD,AD,DE,WEA,WA)")
     Log "Applied non-system volume isolation on $driveRoot for $ServiceUser."
+
+    $skipNames = @((Split-Path -Leaf $ServerRoot), '$RECYCLE.BIN', 'System Volume Information', 'Config.Msi')
+    Get-ChildItem -LiteralPath $driveRoot -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      if ($skipNames -contains $_.Name) { return }
+      if ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
+      try {
+        $acl = Get-Acl -LiteralPath $_.FullName -ErrorAction Stop
+        if ($acl.AreAccessRulesProtected) {
+          if ($_.PSIsContainer) {
+            Invoke-Icacls @($_.FullName, '/L', '/remove:d', $ServiceUser)
+            Invoke-Icacls @($_.FullName, '/L', '/deny', "${ServiceUser}:(OI)(CI)(F)")
+          } else {
+            Invoke-Icacls @($_.FullName, '/L', '/remove:d', $ServiceUser)
+            Invoke-Icacls @($_.FullName, '/L', '/deny', "${ServiceUser}:(F)")
+          }
+          Log "Locked protected sibling $($_.FullName) against $ServiceUser."
+        }
+      } catch {
+        Log "Note: Skipped protected sibling $($_.FullName): $_"
+      }
+    }
   }
 
   # Admin vault & local backups: Owner, Administrators & SYSTEM only, explicitly deny service account
   $privateDirs = @($adminDir, (Join-Path $ServerRoot 'backups'))
   $pubVerDir = Join-Path $ServerRoot 'public-version'
-  if (Test-Path $pubVerDir) { $privateDirs += $pubVerDir }
+  if (Test-Path -LiteralPath $pubVerDir) { $privateDirs += $pubVerDir }
   foreach ($privateDir in $privateDirs) {
     New-Item -ItemType Directory -Force -Path $privateDir | Out-Null
-    Invoke-Icacls @($privateDir, '/inheritance:r', '/remove:d', $ServiceUser)
-    Invoke-Icacls @($privateDir, '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/deny', "${ServiceUser}:(OI)(CI)F")
+    Invoke-Icacls @($privateDir, '/L', '/inheritance:r', '/remove:d', $ServiceUser)
+    Invoke-Icacls @($privateDir, '/L', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/deny', "${ServiceUser}:(OI)(CI)F")
   }
 
-  # Immutable code/scripts/JDK/libraries/versions/plugins root: ReadAndExecute ONLY for service account
+  # Immutable code/scripts/JDK/libraries/versions/config/plugins root: ReadAndExecute ONLY
   $correttoDir = Join-Path $ServerRoot 'Corretto'
-  if (Test-Path $correttoDir) {
+  if (Test-Path -LiteralPath $correttoDir) {
     $takeownOut = & takeown.exe /F $correttoDir /R /A /D Y 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "takeown failed on ${correttoDir} ($LASTEXITCODE): $takeownOut"
     }
   }
 
-  foreach ($roDir in @('scripts', 'Corretto', 'libraries', 'versions', 'cache', 'src', 'plugins')) {
+  foreach ($roDir in @('scripts', 'Corretto', 'libraries', 'versions', 'cache', 'src', 'config', 'plugins')) {
     $p = Join-Path $ServerRoot $roDir
-    if (Test-Path $p) {
-      Invoke-Icacls @($p, '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)RX")
+    if (Test-Path -LiteralPath $p) {
+      Invoke-Icacls @($p, '/L', '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)RX")
     }
   }
-
-  # Grant Modify ONLY on approved plugin data subdirectories
-  $pluginsDir = Join-Path $ServerRoot 'plugins'
-  foreach ($pdName in @('MYTownGatekeeper', 'playit-gg', 'Chunky', 'PurpurExtras', '.paper-remapped', 'bStats', 'spark')) {
-    $pd = Join-Path $pluginsDir $pdName
-    New-Item -ItemType Directory -Force -Path $pd | Out-Null
-    Invoke-Icacls @($pd, '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)M")
-  }
-
-  if (Test-Path $correttoDir) {
+  if (Test-Path -LiteralPath $correttoDir) {
     Invoke-Icacls @((Join-Path $correttoDir '*'), '/reset', '/T', '/Q')
   }
 
-  # Lock executable jars/installers to ReadAndExecute for service account
+  # Lock root config/list files and jar binaries explicitly to ReadAndExecute
+  $roRootFiles = @(
+    'server.properties', 'purpur.yml', 'bukkit.yml', 'spigot.yml', 'commands.yml',
+    'eula.txt', 'ops.json', 'whitelist.json', 'banned-ips.json', 'banned-players.json'
+  )
+  foreach ($rf in $roRootFiles) {
+    $fp = Join-Path $ServerRoot $rf
+    if (Test-Path -LiteralPath $fp) {
+      Invoke-Icacls @($fp, '/L', '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:F', '/grant:r', 'NT AUTHORITY\SYSTEM:F', '/grant:r', "*${ownerSid}:F", '/grant:r', "${ServiceUser}:RX")
+    }
+  }
+
+  $pluginsDir = Join-Path $ServerRoot 'plugins'
   $immutableFiles = @()
   $immutableFiles += Get-ChildItem -Path $ServerRoot -Filter 'purpur-*.jar' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
   $immutableFiles += Get-ChildItem -Path $ServerRoot -Filter '*.msi' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
   $immutableFiles += Get-ChildItem -Path $pluginsDir -Filter '*.jar' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-
   foreach ($f in $immutableFiles) {
-    if ($f -and (Test-Path $f)) {
-      Invoke-Icacls @($f, '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:F', '/grant:r', 'NT AUTHORITY\SYSTEM:F', '/grant:r', "*${ownerSid}:F", '/grant:r', "${ServiceUser}:RX")
+    if ($f -and (Test-Path -LiteralPath $f)) {
+      Invoke-Icacls @($f, '/L', '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:F', '/grant:r', 'NT AUTHORITY\SYSTEM:F', '/grant:r', "*${ownerSid}:F", '/grant:r', "${ServiceUser}:RX")
     }
+  }
+
+  $userCache = Join-Path $ServerRoot 'usercache.json'
+  if (-not (Test-Path -LiteralPath $userCache)) {
+    [System.IO.File]::WriteAllText($userCache, "[]`r`n", (New-Object System.Text.UTF8Encoding $false))
+  }
+  Invoke-Icacls @($userCache, '/L', '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:F', '/grant:r', 'NT AUTHORITY\SYSTEM:F', '/grant:r', "*${ownerSid}:F", '/grant:r', "${ServiceUser}:M")
+
+  # Grant (OI)(CI)(IO)M + (RX,WD,AD) on runtime writable directories (prevents deleting or attaching junctions to top-level dirs)
+  $rwDirs = @(
+    (Join-Path $ServerRoot 'world'),
+    (Join-Path $ServerRoot 'world_nether'),
+    (Join-Path $ServerRoot 'world_the_end'),
+    (Join-Path $ServerRoot 'logs'),
+    (Join-Path $ServerRoot '.paper')
+  )
+  foreach ($pdName in @('MYTownGatekeeper', 'playit-gg', 'Chunky', 'PurpurExtras', '.paper-remapped', 'bStats', 'spark')) {
+    $rwDirs += (Join-Path $pluginsDir $pdName)
+  }
+  foreach ($rwDir in $rwDirs) {
+    New-Item -ItemType Directory -Force -Path $rwDir | Out-Null
+    Invoke-Icacls @($rwDir, '/L', '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)(IO)M", '/grant:r', "${ServiceUser}:(RX,WD,AD)")
   }
   Log "NTFS ACL hardening complete."
 
-  # 4. Windows Defender Firewall SID-bound isolation rules
+  # 4. Windows Defender Firewall SID-bound isolation rules (IPv4 + IPv6 + Inbound)
   Log "Step 4: Creating SID-bound Windows Defender Firewall rules..."
   $sddlUser = "D:(A;;CC;;;$mcSid)"
   $rulePrefix = "${TaskPrefix}-${ServiceUser}-"
   Get-NetFirewallRule -DisplayName "$rulePrefix*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 
-  $blockedCidrs = @('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10')
+  $blockedCidrs = @(
+    '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10',
+    '224.0.0.0/4', '255.255.255.255/32',
+    'fe80::/10', 'fc00::/7', 'ff00::/8'
+  )
   New-NetFirewallRule -DisplayName "${rulePrefix}Block-Outbound-LAN-Meshnet" `
-    -Description "Prevent $ServiceUser from initiating outbound connections to RFC1918 LAN, Link-Local, or VPN Meshnet/CGNAT ranges." `
+    -Description "Prevent $ServiceUser from initiating outbound IPv4/IPv6 connections to RFC1918 LAN, Link-Local, ULA, Multicast, or VPN Meshnet ranges." `
     -Direction Outbound `
     -Action Block `
     -Protocol Any `
@@ -218,14 +282,32 @@ try {
     -Profile Any `
     -Enabled True | Out-Null
 
-  New-NetFirewallRule -DisplayName "${rulePrefix}Block-Inbound-Java" `
-    -Description "Block direct inbound connections to Minecraft java.exe on non-loopback interfaces." `
-    -Direction Inbound `
-    -Action Block `
-    -Protocol Any `
-    -Program $javaExe `
-    -Profile Any `
-    -Enabled True | Out-Null
+  $javaBinDir = Split-Path -Parent $javaExe
+  foreach ($jdkExeName in @('java.exe', 'javaw.exe', 'jwebserver.exe')) {
+    $exePath = Join-Path $javaBinDir $jdkExeName
+    if (Test-Path -LiteralPath $exePath) {
+      New-NetFirewallRule -DisplayName "${rulePrefix}Block-Inbound-$jdkExeName" `
+        -Description "Block direct inbound connections to Minecraft $jdkExeName on non-loopback interfaces." `
+        -Direction Inbound `
+        -Action Block `
+        -Protocol Any `
+        -Program $exePath `
+        -Profile Any `
+        -Enabled True | Out-Null
+    }
+  }
+  try {
+    New-NetFirewallRule -DisplayName "${rulePrefix}Block-Inbound-User" `
+      -Description "Block direct inbound connections to any process owned by $ServiceUser." `
+      -Direction Inbound `
+      -Action Block `
+      -Protocol Any `
+      -LocalUser $sddlUser `
+      -Profile Any `
+      -Enabled True -ErrorAction Stop | Out-Null
+  } catch {
+    Log "Note: Windows Firewall skipped -LocalUser on generic Inbound rule (covered by -Program rules): $_"
+  }
   Log "Firewall rules configured cleanly."
 
   # 5. Grant SeBatchLogonRight & register Scheduled Tasks

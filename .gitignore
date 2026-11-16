@@ -24,6 +24,11 @@ plugins/bStats/
 plugins/spark/
 plugins/Chunky/tasks/
 plugins/Chunky/tasks.log
+plugins/AxAPI/
+plugins/AxVaults/*.db
+plugins/AxVaults/*.mv.db
+plugins/AxVaults/*.trace.db
+plugins/AxVaults/messages.yml
 logs/*.log
 logs/*.gz
 backups/*.zip

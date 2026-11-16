@@ -1,0 +1,3 @@
+axvaults.vault.500:
+  description: Grants 500 6-row personal storage vaults (27,000 slots total) via AxVaults
+  default: true

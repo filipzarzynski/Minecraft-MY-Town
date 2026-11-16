@@ -110,7 +110,7 @@ if ($DownloadDeps) {
     Write-Host "Downloaded & SHA-256 verified: $playitOut"
   }
 
-  foreach ($slug in @('chunky', 'purpurextras')) {
+  foreach ($slug in @('chunky', 'purpurextras', 'axvaults')) {
     $vers = Invoke-RestMethod "https://api.modrinth.com/v2/project/$slug/version?loaders=%5B%22paper%22%5D"
     $v = $vers | Select-Object -First 1
     $f = $v.files | Select-Object -First 1

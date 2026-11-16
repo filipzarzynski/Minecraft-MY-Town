@@ -55,12 +55,13 @@ if ((Get-Content -Path $rcloneConfig -Raw) -match 'CHANGE-ME') {
   throw "$rcloneConfig still contains placeholder OAuth tokens. Run: rclone config create gdrive drive scope drive.file --config `"$rcloneConfig`""
 }
 
-$foldersToCopy = @('world', 'world_nether', 'world_the_end', 'config')
+$foldersToCopy = @('world', 'world_nether', 'world_the_end', 'config', 'plugins\AxVaults')
 $filesToCopy = @(
   'server.properties',
   'purpur.yml',
   'bukkit.yml',
   'spigot.yml',
+  'permissions.yml',
   'plugins\MYTownGatekeeper\accounts.yml',
   'plugins\MYTownGatekeeper\config.yml',
   'plugins\playit-gg\config.yml'

@@ -232,7 +232,7 @@ try {
   # Lock root config/list files and jar binaries explicitly to ReadAndExecute
   $roRootFiles = @(
     'server.properties', 'purpur.yml', 'bukkit.yml', 'spigot.yml', 'commands.yml',
-    'eula.txt', 'ops.json', 'whitelist.json', 'banned-ips.json', 'banned-players.json'
+    'permissions.yml', 'eula.txt', 'ops.json', 'whitelist.json', 'banned-ips.json', 'banned-players.json'
   )
   foreach ($rf in $roRootFiles) {
     $fp = Join-Path $ServerRoot $rf
@@ -281,7 +281,7 @@ try {
     (Join-Path $ServerRoot 'crash-reports'),
     (Join-Path $ServerRoot '.paper')
   )
-  foreach ($pdName in @('MYTownGatekeeper', 'playit-gg', 'Chunky', 'PurpurExtras', '.paper-remapped', 'bStats', 'spark')) {
+  foreach ($pdName in @('MYTownGatekeeper', 'playit-gg', 'Chunky', 'PurpurExtras', 'AxVaults', 'AxAPI', '.paper-remapped', 'bStats', 'spark')) {
     $rwDirs += (Join-Path $pluginsDir $pdName)
   }
   foreach ($rwDir in $rwDirs) {

@@ -45,7 +45,7 @@ settings:
     barrel:
       rows: 3
     ender_chest:
-      six-rows: false
+      six-rows: true
       use-permissions-for-rows: false
       persist-hidden-rows: true
     beehive:

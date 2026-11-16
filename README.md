@@ -12,8 +12,8 @@ The repository mirrors the complete server directory structure (`admin/`, `confi
 | :--- | :---: | :--- |
 | [`admin/`](admin) | Yes (sanitized) | Sanitized placeholder files (`mcserver-password.txt`, `rcon-secret.txt`, `invite-code.txt`, `rclone.conf`, `info.txt`). Locked down by `harden-environment.ps1` so `mcserver` is explicitly denied access. |
 | [`plugins/MYTownGatekeeper.jar`](plugins/MYTownGatekeeper.jar) | Yes (1st-party) | Pre-built Gatekeeper plugin compiled from [`src/MYTownGatekeeper`](src/MYTownGatekeeper). |
-| [`plugins/`](plugins) | Configs only | Pre-tuned plugin configs (`MYTownGatekeeper/`, `playit-gg/`, `Chunky/`, `PurpurExtras/`). Drop third-party `.jar`s here (ignored by `.gitignore`). |
-| [`config/`](config), `purpur.yml`, `server.properties` | Yes | Hardened & casual-friendly Paper/Purpur defaults (`server-ip=127.0.0.1`, `online-mode=false`, `white-list=false`, `hide-online-players=true`, `pause-when-empty-seconds=60`, `creeper.allow-griefing: false`). |
+| [`plugins/`](plugins) | Configs only | Pre-tuned plugin configs (`MYTownGatekeeper/`, `playit-gg/`, `Chunky/`, `PurpurExtras/`, `AxVaults/`). Drop third-party `.jar`s here (ignored by `.gitignore`). |
+| [`config/`](config), `purpur.yml`, `permissions.yml`, `server.properties` | Yes | Hardened & casual-friendly Paper/Purpur defaults (`server-ip=127.0.0.1`, `online-mode=false`, `white-list=false`, `hide-online-players=true`, `pause-when-empty-seconds=60`, `creeper.allow-griefing: false`, `ender_chest.six-rows: true`, and `axvaults.vault.500` in `permissions.yml`). |
 | [`scripts/`](scripts) | Yes | Portable PowerShell automation (`bootstrap-server.ps1`, `build-gatekeeper.ps1`, `harden-environment.ps1`, `start-server.ps1`, `set-ram-mode.ps1`, `mc-cmd.ps1`, `backup-world.ps1`, `ram-mode.json`). |
 | [`Corretto/`](Corretto) | README only | Optional local JDK 25 folder (extract Amazon Corretto 25 here, or install system-wide). |
 | [`backups/`](backups), [`logs/`](logs) | `.gitkeep` only | Runtime backup archives and logs (ignored by `.gitignore`). |
@@ -94,6 +94,7 @@ Compiled in [`plugins/MYTownGatekeeper.jar`](plugins/MYTownGatekeeper.jar) from 
 | **Playit.gg Minecraft Plugin** | [github.com/playit-cloud/playit-minecraft-plugin/releases](https://github.com/playit-cloud/playit-minecraft-plugin/releases) | `plugins\playit-minecraft-plugin.jar` (or fetched via `-DownloadDeps`). Do **not** run standalone `playit.exe`. |
 | **Chunky** | [modrinth.com/plugin/chunky](https://modrinth.com/plugin/chunky) | `plugins\Chunky-Paper-*.jar` (or fetched via `-DownloadDeps`). |
 | **PurpurExtras** | [modrinth.com/plugin/purpurextras](https://modrinth.com/plugin/purpurextras) | `plugins\PurpurExtras-*.jar` (or fetched via `-DownloadDeps`). |
+| **AxVaults** | [modrinth.com/plugin/axvaults](https://modrinth.com/plugin/axvaults) | `plugins\AxVaults-*.jar` (or fetched via `-DownloadDeps`). Provides `/pv` / `/vault` storage (500 6-row vaults per player via `permissions.yml`). |
 | **Rclone** | [rclone.org/downloads](https://rclone.org/downloads/) (`winget install Rclone.Rclone`) | Required on PATH / WinGet Links for `scripts\backup-world.ps1`. |
 
 ---
@@ -108,7 +109,7 @@ cd MY-Town
 Ensure **Amazon Corretto 25 JDK** is installed (or extracted inside `Corretto\`) and **Rclone** is installed (`winget install Rclone.Rclone`).
 
 ### 2. Bootstrap Secrets, Dependencies & Gatekeeper
-Run `bootstrap-server.ps1` (pass `-DownloadDeps` to automatically download Purpur 26.3, Playit plugin, Chunky, and PurpurExtras from official APIs and verify SHA-512 hashes, or omit `-DownloadDeps` if you placed the `.jar`s manually):
+Run `bootstrap-server.ps1` (pass `-DownloadDeps` to automatically download Purpur 26.3, Playit plugin, Chunky, PurpurExtras, and AxVaults from official APIs and verify SHA-512 hashes, or omit `-DownloadDeps` if you placed the `.jar`s manually):
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-server.ps1 -DownloadDeps -AcceptEula
 ```

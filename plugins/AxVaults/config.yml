@@ -1,0 +1,48 @@
+# DOCUMENTATION: https://docs.artillex-studios.com/axvaults.html
+
+prefix: "<gradient:#55ff00:#AAFF00><b>AxVaults</b></gradient> &7» "
+
+auto-save-minutes: 5
+vault-selector-rows: 6
+item-picker-rows: 6
+vault-storage-rows: 6
+
+database:
+  type: "h2"
+
+# 1 - the highest permission gives access to all previous vaults (axvaults.vault.500 -> #1-#500)
+permission-mode: 1
+
+show-locked-vaults: false
+selector-item-amount-mode: 1
+max-vault-amount: -1
+
+clicking-outside-open-selector: false
+vault-selector-blocks: []
+selector-stay-open: false
+delete-empty-vaults: true
+gui-refresh-cooldown-milliseconds: 100
+async-item-serializer: false
+blacklist-items: []
+
+player-command-aliases:
+  - "axvault"
+  - "vault"
+  - "pv"
+  - "axpv"
+  - "axvaults"
+  - "vaults"
+
+admin-command-aliases:
+  - "axvaultsadmin"
+  - "axvaultadmin"
+  - "vaultadmin"
+  - "vaultsadmin"
+
+update-notifier:
+  enabled: false
+  on-join: false
+
+debug: false
+
+version: 11

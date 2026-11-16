@@ -1,0 +1,8 @@
+# MYTownGatekeeper configuration
+invite-code: "CHANGE-ME-INVITE-CODE"
+session-ttl-hours: 24
+auth-timeout-seconds: 90
+min-password-length: 6
+max-password-length: 128
+max-failed-attempts: 5
+lockout-minutes: 15

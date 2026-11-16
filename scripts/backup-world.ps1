@@ -35,6 +35,9 @@ $rcloneExe = Resolve-RclonePath
 if (-not (Test-Path $rcloneConfig)) {
   throw "Missing rclone config at $rcloneConfig. Run: rclone config create gdrive drive scope drive.file --config `"$rcloneConfig`""
 }
+if ((Get-Content -Path $rcloneConfig -Raw) -match 'CHANGE-ME') {
+  throw "$rcloneConfig still contains placeholder OAuth tokens. Run: rclone config create gdrive drive scope drive.file --config `"$rcloneConfig`""
+}
 
 $stamp = (Get-Date).ToString('yyyy-MM-dd_HHmm')
 $stagingDir = Join-Path $backupDir "_staging_$stamp"

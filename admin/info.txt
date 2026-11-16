@@ -1,0 +1,16 @@
+Minecraft Server Project (MY-Town Template)
+
+Target players: 5-24
+Execution user: unprivileged Windows account "mcserver" (password stored in admin/mcserver-password.txt)
+Localhost RCON secret: stored in admin/rcon-secret.txt
+Initial Gatekeeper invite code: stored in admin/invite-code.txt
+
+Purpur Docs:
+https://purpurmc.org/docs/purpur/
+https://purpurmc.org/docs/purpur/installation/
+https://purpurmc.org/docs/purpur/permissions/
+
+PaperMC Docs:
+https://docs.papermc.io/paper/getting-started/
+
+Playit.gg account placeholder: <your-playit-account-email>

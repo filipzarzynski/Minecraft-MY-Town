@@ -18,7 +18,7 @@ function Resolve-JdkBin {
   }
   $javacCmd = Get-Command javac -ErrorAction SilentlyContinue
   if ($javacCmd) { return (Split-Path -Parent $javacCmd.Source) }
-  throw "JDK 25 (javac.exe) not found. Install Amazon Corretto 25 or extract it under '$ServerRoot\Corretto\'."
+  throw "JDK 25 (javac.exe) not found. Install Amazon Corretto 25 or place it under '$ServerRoot\Corretto\'."
 }
 
 function New-SecretString([int]$Length, [string]$Charset) {
@@ -31,11 +31,17 @@ function New-SecretString([int]$Length, [string]$Charset) {
   return $sb.ToString()
 }
 
+function Test-NeedsSecret([string]$Path) {
+  if (-not (Test-Path $Path)) { return $true }
+  $val = (Get-Content -Path $Path -Raw).Trim()
+  return ([string]::IsNullOrWhiteSpace($val) -or $val -like 'CHANGE-ME*')
+}
+
 foreach ($d in @('admin', 'backups', 'logs', 'plugins', 'scripts')) {
   New-Item -ItemType Directory -Force -Path (Join-Path $ServerRoot $d) | Out-Null
 }
 
-# 1. Generate local secrets if absent
+# 1. Rotate any missing or CHANGE-ME placeholder secrets in admin\
 $alnum = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
 $complex = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#_-+=?'
 
@@ -43,25 +49,25 @@ $mcPassFile = Join-Path $ServerRoot 'admin\mcserver-password.txt'
 $rconFile = Join-Path $ServerRoot 'admin\rcon-secret.txt'
 $inviteFile = Join-Path $ServerRoot 'admin\invite-code.txt'
 
-if (-not (Test-Path $mcPassFile)) {
+if (Test-NeedsSecret $mcPassFile) {
   $mcPass = 'Mc!' + (New-SecretString 29 $complex) + '9A'
   [System.IO.File]::WriteAllText($mcPassFile, $mcPass, (New-Object System.Text.UTF8Encoding $false))
   Write-Host "Generated $ServiceUser service password at $mcPassFile"
 }
-if (-not (Test-Path $rconFile)) {
+if (Test-NeedsSecret $rconFile) {
   $rconPass = New-SecretString 32 $alnum
   [System.IO.File]::WriteAllText($rconFile, $rconPass, (New-Object System.Text.UTF8Encoding $false))
   Write-Host "Generated RCON password at $rconFile"
 }
-if (-not (Test-Path $inviteFile)) {
+if ($InviteCode -or (Test-NeedsSecret $inviteFile)) {
   $code = if ($InviteCode) { $InviteCode.Trim() } else { 'MYTOWN-' + (New-SecretString 12 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789') }
   [System.IO.File]::WriteAllText($inviteFile, $code, (New-Object System.Text.UTF8Encoding $false))
-  Write-Host "Generated initial server invite code at $inviteFile"
+  Write-Host "Set server invite code at $inviteFile"
 }
 
 # 2. Download third-party jars from official APIs if requested
 if ($DownloadDeps) {
-  Write-Host "Downloading Purpur 26.3 and plugins from official APIs..."
+  Write-Host "Downloading Purpur 26.3 and third-party plugins from official APIs..."
   $purpurInfo = Invoke-RestMethod 'https://api.purpurmc.org/v2/purpur/26.3'
   $build = $purpurInfo.builds.latest
   $purpurJarPath = Join-Path $ServerRoot "purpur-26.3-$build.jar"
@@ -111,7 +117,7 @@ if (-not (Test-Path (Join-Path $ServerRoot 'libraries\com\mojang\brigadier'))) {
   }
 }
 
-# 4. Compile MYTownGatekeeper plugin and write its config.yml
+# 4. Compile MYTownGatekeeper.jar from source and sync invite-code into plugins\MYTownGatekeeper\config.yml
 & (Join-Path $PSScriptRoot 'build-gatekeeper.ps1') -ServerRoot $ServerRoot
 
 $inviteVal = (Get-Content -Path $inviteFile -Raw).Trim()
@@ -130,26 +136,46 @@ max-failed-attempts: 5
 lockout-minutes: 15
 "@
   [System.IO.File]::WriteAllText($gkConfig, $cfgText, (New-Object System.Text.UTF8Encoding $false))
+} else {
+  $gkText = Get-Content -Path $gkConfig -Raw
+  if ($gkText -match 'invite-code:\s*"?CHANGE-ME[^"\r\n]*"?' -or $InviteCode) {
+    $gkText = [regex]::Replace($gkText, 'invite-code:\s*"?[^"\r\n]*"?', "invite-code: `"$inviteVal`"")
+    [System.IO.File]::WriteAllText($gkConfig, $gkText, (New-Object System.Text.UTF8Encoding $false))
+    Write-Host "Synced invite code into $gkConfig"
+  }
 }
 
-# 5. Write server.properties and eula.txt if not already present
+# 5. Sync generated RCON & management secrets into server.properties
 $propsDest = Join-Path $ServerRoot 'server.properties'
-if (-not (Test-Path $propsDest)) {
-  $template = Get-Content -Path (Join-Path $ServerRoot 'config-templates\server.properties.example') -Raw
+if (Test-Path $propsDest) {
   $rconSecret = (Get-Content -Path $rconFile -Raw).Trim()
-  $rendered = $template.Replace('__RCON_PASSWORD__', $rconSecret)
-  [System.IO.File]::WriteAllText($propsDest, $rendered, (New-Object System.Text.UTF8Encoding $false))
-  Write-Host "Created $propsDest"
+  $mgmtSecret = New-SecretString 40 $alnum
+  $propsText = Get-Content -Path $propsDest -Raw
+  $changed = $false
+  if ($propsText -match 'rcon\.password=CHANGE-ME[^\r\n]*') {
+    $propsText = [regex]::Replace($propsText, 'rcon\.password=CHANGE-ME[^\r\n]*', "rcon.password=$rconSecret")
+    $changed = $true
+  }
+  if ($propsText -match 'management-server-secret=CHANGE-ME[^\r\n]*') {
+    $propsText = [regex]::Replace($propsText, 'management-server-secret=CHANGE-ME[^\r\n]*', "management-server-secret=$mgmtSecret")
+    $changed = $true
+  }
+  if ($changed) {
+    [System.IO.File]::WriteAllText($propsDest, $propsText, (New-Object System.Text.UTF8Encoding $false))
+    Write-Host "Synced generated secrets into $propsDest"
+  }
 }
 
+# 6. Accept Minecraft EULA if still false
 $eulaPath = Join-Path $ServerRoot 'eula.txt'
-if (-not (Test-Path $eulaPath)) {
+$eulaAccepted = (Test-Path $eulaPath) -and ((Get-Content -Path $eulaPath -Raw) -match '(?m)^eula\s*=\s*true\s*$')
+if (-not $eulaAccepted) {
   if (-not $AcceptEula) {
     $ans = Read-Host "Do you accept the Minecraft EULA (https://aka.ms/MinecraftEULA)? Type 'yes' to accept"
     if ($ans -ne 'yes') { throw "Minecraft EULA was not accepted. Re-run with -AcceptEula once ready." }
   }
-  [System.IO.File]::WriteAllText($eulaPath, "eula=true`r`n", (New-Object System.Text.UTF8Encoding $false))
-  Write-Host "Created $eulaPath (eula=true)"
+  [System.IO.File]::WriteAllText($eulaPath, "# Accepted via bootstrap-server.ps1 (https://aka.ms/MinecraftEULA)`r`neula=true`r`n", (New-Object System.Text.UTF8Encoding $false))
+  Write-Host "Accepted EULA in $eulaPath (eula=true)"
 }
 
 Write-Host ""

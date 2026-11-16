@@ -1,43 +1,31 @@
-# Compiled binaries, installers, and archives
-*.jar
+# Third-party binaries, installers, and archives (1st-party MYTownGatekeeper.jar stays tracked)
+purpur-*.jar
 *.msi
 *.exe
 *.zip
 *.tar.gz
+plugins/*.jar
+!plugins/MYTownGatekeeper.jar
 
-# Secrets, credentials, and admin vault
-admin/
-*.secret
-*password*
-rclone.conf
-accounts.yml
-
-# Runtime directories and world saves
+# Generated runtime directories, worlds, and third-party plugin runtime caches
 world/
 world_nether/
 world_the_end/
-backups/
-logs/
 cache/
 libraries/
 versions/
-config/
-plugins/
 crash-reports/
+.paper/
 .build-libs/
 build/
-
-# Server configuration generated or containing credentials
-server.properties
-eula.txt
-ops.json
-whitelist.json
-banned-ips.json
-banned-players.json
+Corretto/jdk*/
+plugins/.paper-remapped/
+plugins/bStats/
+plugins/spark/
+plugins/Chunky/tasks/
+plugins/Chunky/tasks.log
+logs/*.log
+logs/*.gz
+backups/*.zip
+admin/*.log
 usercache.json
-bukkit.yml
-spigot.yml
-purpur.yml
-commands.yml
-permissions.yml
-help.yml

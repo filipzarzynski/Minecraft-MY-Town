@@ -69,6 +69,9 @@ try {
     throw "Missing $mcPassFile. Run scripts\bootstrap-server.ps1 first."
   }
   $mcPassPlain = (Get-Content -Path $mcPassFile -Raw).Trim()
+  if ([string]::IsNullOrWhiteSpace($mcPassPlain) -or $mcPassPlain -like 'CHANGE-ME*') {
+    throw "$mcPassFile still contains a placeholder password. Run scripts\bootstrap-server.ps1 or replace it with a strong password first."
+  }
   $mcPassSec = ConvertTo-SecureString $mcPassPlain -AsPlainText -Force
 
   $existingUser = Get-LocalUser -Name $ServiceUser -ErrorAction SilentlyContinue

@@ -258,12 +258,27 @@ try {
   }
   Invoke-Icacls @($userCache, '/L', '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:F', '/grant:r', 'NT AUTHORITY\SYSTEM:F', '/grant:r', "*${ownerSid}:F", '/grant:r', "${ServiceUser}:M")
 
+  # Remove empty legacy Bukkit dimension folders if present (MC/Paper 26.3 stores dimensions under world\dimensions\;
+  # empty world_nether/world_the_end directories trigger a 30s WorldFolderMigration delay and fail to self-delete under RX root ACL)
+  foreach ($legacyDim in @('world_nether', 'world_the_end')) {
+    $legacyPath = Join-Path $ServerRoot $legacyDim
+    if (Test-Path -LiteralPath $legacyPath) {
+      $legacyItem = Get-Item -LiteralPath $legacyPath -Force
+      if (-not ($legacyItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        $childCount = @(Get-ChildItem -LiteralPath $legacyPath -Force -ErrorAction SilentlyContinue).Count
+        if ($childCount -eq 0) {
+          Remove-Item -LiteralPath $legacyPath -Force
+          Log "Removed empty legacy dimension folder $legacyPath."
+        }
+      }
+    }
+  }
+
   # Grant (OI)(CI)(IO)M + (RX,WD,AD) on runtime writable directories (prevents deleting or attaching junctions to top-level dirs)
   $rwDirs = @(
     (Join-Path $ServerRoot 'world'),
-    (Join-Path $ServerRoot 'world_nether'),
-    (Join-Path $ServerRoot 'world_the_end'),
     (Join-Path $ServerRoot 'logs'),
+    (Join-Path $ServerRoot 'crash-reports'),
     (Join-Path $ServerRoot '.paper')
   )
   foreach ($pdName in @('MYTownGatekeeper', 'playit-gg', 'Chunky', 'PurpurExtras', '.paper-remapped', 'bStats', 'spark')) {

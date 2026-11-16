@@ -97,7 +97,39 @@ try {
   }
 
   # 3. Apply least-privilege NTFS ACLs
-  Log "Step 3: Applying least-privilege NTFS ACLs under $ServerRoot..."
+  Log "Step 3: Stopping running server cleanly (if online) and applying least-privilege NTFS ACLs under $ServerRoot..."
+  $mcCmd = Join-Path $ServerRoot 'scripts\mc-cmd.ps1'
+  $runningJava = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $javaExe -and $_.CommandLine -match [regex]::Escape($ServerRoot) }
+  if ($runningJava) {
+    try {
+      & $mcCmd -Command 'save-all flush' | Out-Null
+      & $mcCmd -Command 'stop' | Out-Null
+    } catch {
+      Log "RCON stop note: $_"
+    }
+    $deadline = (Get-Date).AddSeconds(45)
+    while ((Get-Date) -lt $deadline) {
+      $stillUp = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $javaExe -and $_.CommandLine -match [regex]::Escape($ServerRoot) }
+      if (-not $stillUp) { break }
+      Start-Sleep -Seconds 1
+    }
+    $stillUp = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $javaExe -and $_.CommandLine -match [regex]::Escape($ServerRoot) }
+    if ($stillUp) {
+      $stillUp | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+      Start-Sleep -Seconds 2
+      Log "Forced remaining java.exe stop after 45s."
+    } else {
+      Log "Server stopped gracefully."
+    }
+  }
+
+  $pendingGk = Join-Path $ServerRoot 'plugins\MYTownGatekeeper.jar.pending'
+  $liveGk = Join-Path $ServerRoot 'plugins\MYTownGatekeeper.jar'
+  if (Test-Path $pendingGk) {
+    Move-Item -Path $pendingGk -Destination $liveGk -Force
+    Log "Applied staged MYTownGatekeeper.jar update."
+  }
+
   $ownerSid = $identity.User.Value
   function Invoke-Icacls([string[]]$IcaclsArgs) {
     $out = & icacls @IcaclsArgs 2>&1 | Out-String
@@ -106,16 +138,29 @@ try {
     }
   }
 
-  # Root runtime: service account gets Modify on world/logs/config/plugin data
-  Invoke-Icacls @($ServerRoot, '/grant', 'BUILTIN\Administrators:(OI)(CI)F', '/grant', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant', "*${ownerSid}:(OI)(CI)F", '/grant', "${ServiceUser}:(OI)(CI)M")
+  # Root runtime: break inheritance from parent drive (strips Authenticated Users:(M)) and grant service account Modify
+  Invoke-Icacls @($ServerRoot, '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)M")
 
-  # Admin vault & local backups: Owner, Administrators & SYSTEM only, explicitly deny service account
-  foreach ($privateDir in @($adminDir, (Join-Path $ServerRoot 'backups'))) {
-    New-Item -ItemType Directory -Force -Path $privateDir | Out-Null
-    Invoke-Icacls @($privateDir, '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/deny', "${ServiceUser}:(OI)(CI)F")
+  # Isolate parent non-system volume root so service account can traverse into $ServerRoot without accessing sibling files/folders
+  $driveRoot = (Split-Path -Qualifier $ServerRoot) + '\'
+  if ($driveRoot.TrimEnd('\') -ine $env:SystemDrive) {
+    Invoke-Icacls @($driveRoot, '/remove:d', $ServiceUser)
+    Invoke-Icacls @($driveRoot, '/deny', "${ServiceUser}:(OI)(CI)(IO)(F)")
+    Invoke-Icacls @($driveRoot, '/deny', "${ServiceUser}:(WD,AD,DE)")
+    Log "Applied non-system volume isolation on $driveRoot for $ServiceUser."
   }
 
-  # Immutable code/scripts/JDK/libraries/versions: ReadAndExecute ONLY for service account
+  # Admin vault & local backups: Owner, Administrators & SYSTEM only, explicitly deny service account
+  $privateDirs = @($adminDir, (Join-Path $ServerRoot 'backups'))
+  $pubVerDir = Join-Path $ServerRoot 'public-version'
+  if (Test-Path $pubVerDir) { $privateDirs += $pubVerDir }
+  foreach ($privateDir in $privateDirs) {
+    New-Item -ItemType Directory -Force -Path $privateDir | Out-Null
+    Invoke-Icacls @($privateDir, '/inheritance:r', '/remove:d', $ServiceUser)
+    Invoke-Icacls @($privateDir, '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/deny', "${ServiceUser}:(OI)(CI)F")
+  }
+
+  # Immutable code/scripts/JDK/libraries/versions/plugins root: ReadAndExecute ONLY for service account
   $correttoDir = Join-Path $ServerRoot 'Corretto'
   if (Test-Path $correttoDir) {
     $takeownOut = & takeown.exe /F $correttoDir /R /A /D Y 2>&1 | Out-String
@@ -124,12 +169,21 @@ try {
     }
   }
 
-  foreach ($roDir in @('scripts', 'Corretto', 'libraries', 'versions', 'cache', 'src', 'config-templates')) {
+  foreach ($roDir in @('scripts', 'Corretto', 'libraries', 'versions', 'cache', 'src', 'plugins')) {
     $p = Join-Path $ServerRoot $roDir
     if (Test-Path $p) {
       Invoke-Icacls @($p, '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)RX")
     }
   }
+
+  # Grant Modify ONLY on approved plugin data subdirectories
+  $pluginsDir = Join-Path $ServerRoot 'plugins'
+  foreach ($pdName in @('MYTownGatekeeper', 'playit-gg', 'Chunky', 'PurpurExtras', '.paper-remapped', 'bStats', 'spark')) {
+    $pd = Join-Path $pluginsDir $pdName
+    New-Item -ItemType Directory -Force -Path $pd | Out-Null
+    Invoke-Icacls @($pd, '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)M")
+  }
+
   if (Test-Path $correttoDir) {
     Invoke-Icacls @((Join-Path $correttoDir '*'), '/reset', '/T', '/Q')
   }
@@ -138,7 +192,7 @@ try {
   $immutableFiles = @()
   $immutableFiles += Get-ChildItem -Path $ServerRoot -Filter 'purpur-*.jar' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
   $immutableFiles += Get-ChildItem -Path $ServerRoot -Filter '*.msi' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-  $immutableFiles += Get-ChildItem -Path (Join-Path $ServerRoot 'plugins') -Filter '*.jar' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+  $immutableFiles += Get-ChildItem -Path $pluginsDir -Filter '*.jar' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 
   foreach ($f in $immutableFiles) {
     if ($f -and (Test-Path $f)) {

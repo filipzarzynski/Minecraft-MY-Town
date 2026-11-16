@@ -156,32 +156,46 @@ try {
   # Lock $ServerRoot itself to ReadAndExecute only (blocks dropping new server jars or tampering with root configs)
   Invoke-Icacls @($ServerRoot, '/L', '/inheritance:r', '/grant:r', 'BUILTIN\Administrators:(OI)(CI)F', '/grant:r', 'NT AUTHORITY\SYSTEM:(OI)(CI)F', '/grant:r', "*${ownerSid}:(OI)(CI)F", '/grant:r', "${ServiceUser}:(OI)(CI)RX")
 
-  # Isolate parent non-system volume root so service account can traverse into $ServerRoot without accessing sibling files/folders
+  # Isolate parent non-system volume root so service account can traverse into $ServerRoot without accessing sibling files/folders.
+  # Note: RD (FILE_LIST_DIRECTORY) is intentionally omitted on the volume root itself because OpenJDK's
+  # WindowsLinkSupport.getRealPath() calls FindFirstFileW along parent path components when Paperclip/Paper
+  # closes ZipFileSystems on startup; all inheriting sibling files/folders still receive (OI)(CI)(IO)(F) Deny.
   $driveRoot = (Split-Path -Qualifier $ServerRoot) + '\'
   if ($driveRoot.TrimEnd('\') -ine $env:SystemDrive) {
     Invoke-Icacls @($driveRoot, '/L', '/remove:d', $ServiceUser)
     Invoke-Icacls @($driveRoot, '/L', '/deny', "${ServiceUser}:(OI)(CI)(IO)(F)")
-    Invoke-Icacls @($driveRoot, '/L', '/deny', "${ServiceUser}:(RD,WD,AD,DE,WEA,WA)")
+    Invoke-Icacls @($driveRoot, '/L', '/deny', "${ServiceUser}:(WD,AD,DE,WEA,WA)")
     Log "Applied non-system volume isolation on $driveRoot for $ServiceUser."
 
-    $skipNames = @((Split-Path -Leaf $ServerRoot), '$RECYCLE.BIN', 'System Volume Information', 'Config.Msi')
+    $skipNames = @(
+      (Split-Path -Leaf $ServerRoot),
+      '$RECYCLE.BIN', 'System Volume Information', 'Config.Msi',
+      'Program Files', 'Program Files (x86)', 'WindowsApps',
+      'pagefile.sys', 'swapfile.sys', 'hiberfil.sys', 'DumpStack.log', 'DumpStack.log.tmp'
+    )
     Get-ChildItem -LiteralPath $driveRoot -Force -ErrorAction SilentlyContinue | ForEach-Object {
-      if ($skipNames -contains $_.Name) { return }
-      if ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
+      $sibling = $_
+      if ($skipNames -contains $sibling.Name) { return }
+      if ($sibling.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
       try {
-        $acl = Get-Acl -LiteralPath $_.FullName -ErrorAction Stop
+        $acl = Get-Acl -LiteralPath $sibling.FullName -ErrorAction Stop
         if ($acl.AreAccessRulesProtected) {
-          if ($_.PSIsContainer) {
-            Invoke-Icacls @($_.FullName, '/L', '/remove:d', $ServiceUser)
-            Invoke-Icacls @($_.FullName, '/L', '/deny', "${ServiceUser}:(OI)(CI)(F)")
+          if ($sibling.PSIsContainer) {
+            Invoke-Icacls @($sibling.FullName, '/L', '/remove:d', $ServiceUser)
+            Invoke-Icacls @($sibling.FullName, '/L', '/deny', "${ServiceUser}:(OI)(CI)(F)")
           } else {
-            Invoke-Icacls @($_.FullName, '/L', '/remove:d', $ServiceUser)
-            Invoke-Icacls @($_.FullName, '/L', '/deny', "${ServiceUser}:(F)")
+            Invoke-Icacls @($sibling.FullName, '/L', '/remove:d', $ServiceUser)
+            Invoke-Icacls @($sibling.FullName, '/L', '/deny', "${ServiceUser}:(F)")
           }
-          Log "Locked protected sibling $($_.FullName) against $ServiceUser."
+          Log "Locked protected sibling $($sibling.FullName) against $ServiceUser."
         }
       } catch {
-        Log "Note: Skipped protected sibling $($_.FullName): $_"
+        $errMsg = $_.ToString()
+        if ($errMsg -match 'Access is denied') {
+          Log "Note: Skipped sibling $($sibling.FullName) (Access denied - likely Windows Defender Controlled Folder Access blocking icacls.exe)."
+        } else {
+          Log "Note: Skipped protected sibling $($sibling.FullName): $errMsg"
+        }
       }
     }
   }
@@ -409,7 +423,7 @@ try {
   if (-not $NoStart) {
     Log "Step 6: Starting Scheduled Task '$mcTaskName'..."
     Start-ScheduledTask -TaskName $mcTaskName
-    Start-Sleep -Seconds 5
+    Start-Sleep -Seconds 12
     $taskInfo = Get-ScheduledTaskInfo -TaskName $mcTaskName
     Log "Task '$mcTaskName' State=$((Get-ScheduledTask -TaskName $mcTaskName).State) LastTaskResult=$($taskInfo.LastTaskResult)"
     $wrapperLog = Join-Path $ServerRoot 'logs\wrapper.log'
@@ -418,8 +432,12 @@ try {
       Get-Content -Path $wrapperLog -Tail 15 | ForEach-Object { Log $_ }
     }
     $javaProc = Get-Process -Name 'java' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $javaExe }
-    foreach ($jp in $javaProc) {
-      Log "Running java.exe PID=$($jp.Id) ProcessorAffinity=$($jp.ProcessorAffinity) PriorityClass=$($jp.PriorityClass)"
+    if (-not $javaProc) {
+      Log "WARNING: java.exe is not running after 12s! Check $wrapperLog and $($ServerRoot)\logs\latest.log."
+    } else {
+      foreach ($jp in $javaProc) {
+        Log "Running java.exe PID=$($jp.Id) ProcessorAffinity=$($jp.ProcessorAffinity) PriorityClass=$($jp.PriorityClass)"
+      }
     }
   }
   Log "=== Hardening Complete ==="

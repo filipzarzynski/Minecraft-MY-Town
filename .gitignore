@@ -1,0 +1,43 @@
+# Compiled binaries, installers, and archives
+*.jar
+*.msi
+*.exe
+*.zip
+*.tar.gz
+
+# Secrets, credentials, and admin vault
+admin/
+*.secret
+*password*
+rclone.conf
+accounts.yml
+
+# Runtime directories and world saves
+world/
+world_nether/
+world_the_end/
+backups/
+logs/
+cache/
+libraries/
+versions/
+config/
+plugins/
+crash-reports/
+.build-libs/
+build/
+
+# Server configuration generated or containing credentials
+server.properties
+eula.txt
+ops.json
+whitelist.json
+banned-ips.json
+banned-players.json
+usercache.json
+bukkit.yml
+spigot.yml
+purpur.yml
+commands.yml
+permissions.yml
+help.yml

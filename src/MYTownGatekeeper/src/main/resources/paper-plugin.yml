@@ -1,0 +1,7 @@
+name: MYTownGatekeeper
+version: "1.0.0"
+main: digital.filip.mytown.MYTownGatekeeperPlugin
+api-version: "26.1"
+authors:
+  - MY-Town
+description: Pre-join GUI Gatekeeper providing server invite verification and per-account password authentication.

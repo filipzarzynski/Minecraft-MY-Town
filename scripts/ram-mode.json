@@ -1,0 +1,8 @@
+{
+  "Mode": "Prealloc",
+  "ActiveProcessorCount": 3,
+  "AffinityMask": 56,
+  "PriorityClass": "BelowNormal",
+  "PreallocFlags": "-Xms12G -Xmx12G -XX:+UseZGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC",
+  "DynamicFlags": "-Xms2G -Xmx12G -XX:+UseZGC -XX:+ZUncommit -XX:ZUncommitDelay=180 -XX:+DisableExplicitGC"
+}

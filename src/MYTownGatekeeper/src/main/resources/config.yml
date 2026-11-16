@@ -1,0 +1,17 @@
+# MYTownGatekeeper configuration
+# Invite secret required for first-time player registration
+invite-code: "CHANGE-ME"
+
+# Hours before a player connecting from the same IP must re-enter their personal password (0 = every join)
+session-ttl-hours: 24
+
+# Seconds to wait for the player to submit the pre-join dialog before disconnecting
+auth-timeout-seconds: 90
+
+# Minimum and maximum personal password length
+min-password-length: 6
+max-password-length: 128
+
+# Brute-force protection (per IP and per username)
+max-failed-attempts: 5
+lockout-minutes: 15

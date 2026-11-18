@@ -89,7 +89,7 @@ Compiled in [`plugins/MYTownGatekeeper.jar`](plugins/MYTownGatekeeper.jar) from 
 
 | Component | Official Source | Where to Place |
 | :--- | :--- | :--- |
-| **Amazon Corretto 25 JDK** | [aws.amazon.com/corretto](https://aws.amazon.com/corretto/) | Extract under [`Corretto/`](Corretto) (e.g., `Corretto\jdk25.0.5_0`) or install system-wide. |
+| **Amazon Corretto 25 JDK (25.0.5.1.2+)** | [github.com/corretto/corretto-25/releases](https://github.com/corretto/corretto-25/releases/latest) | Extract `25.0.5.1.2+` (patches **CVE-2026-114938 "Java4Shell"**) under [`Corretto/`](Corretto) or install system-wide. |
 | **Purpur 26.3** | [purpurmc.org/downloads](https://purpurmc.org/downloads) | Server root as `purpur-26.3-*.jar` (or fetched automatically via `-DownloadDeps`). |
 | **Playit.gg Minecraft Plugin** | [github.com/playit-cloud/playit-minecraft-plugin/releases](https://github.com/playit-cloud/playit-minecraft-plugin/releases) | `plugins\playit-minecraft-plugin.jar` (or fetched via `-DownloadDeps`). Do **not** run standalone `playit.exe`. |
 | **Chunky** | [modrinth.com/plugin/chunky](https://modrinth.com/plugin/chunky) | `plugins\Chunky-Paper-*.jar` (or fetched via `-DownloadDeps`). |
@@ -106,7 +106,7 @@ Compiled in [`plugins/MYTownGatekeeper.jar`](plugins/MYTownGatekeeper.jar) from 
 git clone https://github.com/filipzarzynski/Minecraft-MY-Town.git MY-Town
 cd MY-Town
 ```
-Ensure **Amazon Corretto 25 JDK** is installed (or extracted inside `Corretto\`) and **Rclone** is installed (`winget install Rclone.Rclone`).
+Ensure **Amazon Corretto 25 JDK (`25.0.5.1.2+`)** is installed (or extracted inside `Corretto\`) and **Rclone** is installed (`winget install Rclone.Rclone`).
 
 ### 2. Bootstrap Secrets, Dependencies & Gatekeeper
 Run `bootstrap-server.ps1` (pass `-DownloadDeps` to automatically download Purpur 26.3, Playit plugin, Chunky, PurpurExtras, and AxVaults from official APIs and verify SHA-512 hashes, or omit `-DownloadDeps` if you placed the `.jar`s manually):

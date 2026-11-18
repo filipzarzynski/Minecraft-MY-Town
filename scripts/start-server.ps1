@@ -68,7 +68,8 @@ try {
 
   $jvmArgs = @(
     "-XX:ActiveProcessorCount=$activeProcs",
-    '-XX:+PerfDisableSharedMem'
+    '-XX:+PerfDisableSharedMem',
+    '-XX:-UseBASE64Intrinsics'
   ) + ($memFlags -split '\s+' | Where-Object { $_ }) + @(
     '-jar', $purpurJar.FullName,
     '--nogui'

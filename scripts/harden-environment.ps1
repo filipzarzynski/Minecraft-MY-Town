@@ -435,10 +435,10 @@ try {
   Log "Registered Scheduled Task '$bkTaskName' under $adminPrincipalName."
 
   $wdTaskName = "${TaskPrefix}-Watchdog"
-  $wdScript = Join-Path $ServerRoot 'scripts\server-watchdog.ps1'
+  $wdVbs = Join-Path $ServerRoot 'scripts\run-watchdog-hidden.vbs'
   Unregister-ScheduledTask -TaskName $wdTaskName -Confirm:$false -ErrorAction SilentlyContinue
-  $wdAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$wdScript`"" `
+  $wdAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
+    -Argument "//B //NoLogo `"$wdVbs`"" `
     -WorkingDirectory $ServerRoot
   $wdTriggerLogon  = New-ScheduledTaskTrigger -AtLogOn -User $adminPrincipalName
   $wdTriggerRepeat = New-ScheduledTaskTrigger -Once -At ([datetime]::Today) -RepetitionInterval (New-TimeSpan -Minutes 2)

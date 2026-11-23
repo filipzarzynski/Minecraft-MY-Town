@@ -30,7 +30,10 @@ plugins/AxVaults/*.mv.db
 plugins/AxVaults/*.trace.db
 plugins/AxVaults/messages.yml
 logs/*.log
+logs/*.jsonl
 logs/*.gz
 backups/*.zip
 admin/*.log
+admin/intentional-stop.flag
+admin/watchdog-state.json
 usercache.json

@@ -434,6 +434,28 @@ try {
     -Description "Daily RCON-safe world backup uploaded to Google Drive via least-privilege rclone." | Out-Null
   Log "Registered Scheduled Task '$bkTaskName' under $adminPrincipalName."
 
+  $wdTaskName = "${TaskPrefix}-Watchdog"
+  $wdScript = Join-Path $ServerRoot 'scripts\server-watchdog.ps1'
+  Unregister-ScheduledTask -TaskName $wdTaskName -Confirm:$false -ErrorAction SilentlyContinue
+  $wdAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$wdScript`"" `
+    -WorkingDirectory $ServerRoot
+  $wdTrigger = New-ScheduledTaskTrigger -Once -At ([datetime]::Today) -RepetitionInterval (New-TimeSpan -Minutes 2)
+  $wdPrincipal = New-ScheduledTaskPrincipal -UserId $adminPrincipalName -LogonType S4U -RunLevel Highest
+  $wdSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+    -MultipleInstances IgnoreNew
+  Register-ScheduledTask -TaskName $wdTaskName `
+    -Action $wdAction `
+    -Trigger $wdTrigger `
+    -Principal $wdPrincipal `
+    -Settings $wdSettings `
+    -Description "Monitors $TaskPrefix Purpur + Playit health every 2 minutes, auto-recovers crashes/hung tunnels, and logs downtime causes." | Out-Null
+  Log "Registered Scheduled Task '$wdTaskName' under $adminPrincipalName."
+
   # 6. Start Minecraft Server Scheduled Task
   if (-not $NoStart) {
     Log "Step 6: Starting Scheduled Task '$mcTaskName'..."

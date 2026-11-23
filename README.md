@@ -137,7 +137,7 @@ Open **Terminal (Admin)** and run:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\harden-environment.ps1
 ```
-This creates/hardens `mcserver`, locks NTFS ACLs, sets SID-bound firewall rules, grants `SeBatchLogonRight`, registers `MY-Town-Minecraft-Server` (boot startup) and `MY-Town-Daily-Backup` (`04:30 AM` daily), and starts the server.
+This creates/hardens `mcserver`, locks NTFS ACLs, sets SID-bound firewall rules, grants `SeBatchLogonRight`, registers `MY-Town-Minecraft-Server` (boot startup), `MY-Town-Daily-Backup` (`04:30 AM` daily), and `MY-Town-Watchdog` (2-minute health check & auto-recovery), and starts the server.
 
 ### 6. Claim Playit.gg Tunnel
 Find the one-time Playit claim link in `logs\latest.log`:
@@ -170,6 +170,18 @@ Open it in your browser to link the tunnel to your Playit.gg account and obtain 
 ## Day-to-Day Administration
 
 ```powershell
+# Check live health (Task status, java.exe PID/RAM, localhost SLP, RCON, Playit SRV ping, & downtime log)
+.\scripts\server-status.ps1
+
+# Safe start / stop / restart (Stop sets admin\intentional-stop.flag so the watchdog won't auto-restart it)
+.\scripts\server-control.ps1 -Action Stop -Reason "Maintenance"
+.\scripts\server-control.ps1 -Action Start
+.\scripts\server-control.ps1 -Action Restart -Reason "Config update"
+.\scripts\server-control.ps1 -Action RestartPlayit
+
+# Run an on-demand health check & auto-recovery pass (Scheduled Task runs this every 2 minutes)
+.\scripts\server-watchdog.ps1
+
 # Localhost RCON console commands
 .\scripts\mc-cmd.ps1 "list"
 .\scripts\mc-cmd.ps1 "chunky progress"

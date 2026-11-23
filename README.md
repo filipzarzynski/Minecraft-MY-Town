@@ -173,13 +173,18 @@ Open it in your browser to link the tunnel to your Playit.gg account and obtain 
 # Check live health (Task status, java.exe PID/RAM, localhost SLP, RCON, Playit SRV ping, & downtime log)
 .\scripts\server-status.ps1
 
-# Safe start / stop / restart (Stop sets admin\intentional-stop.flag so the watchdog won't auto-restart it)
+# View player playtime, sessions, daily activity, and peak capacity vs max-players
+.\scripts\server-stats.ps1
+
+# Safe start / stop / restart / password reset (Stop sets admin\intentional-stop.flag so the watchdog won't auto-restart it)
 .\scripts\server-control.ps1 -Action Stop -Reason "Maintenance"
 .\scripts\server-control.ps1 -Action Start
 .\scripts\server-control.ps1 -Action Restart -Reason "Config update"
 .\scripts\server-control.ps1 -Action RestartPlayit
+.\scripts\server-control.ps1 -Action ResetPassword -Player <Username>
+.\scripts\server-control.ps1 -Action ClearLockout -Player all
 
-# Run an on-demand health check & auto-recovery pass (Scheduled Task runs this every 2 minutes)
+# Run an on-demand health check & auto-recovery pass (Scheduled Task runs at Windows logon and every 2 minutes)
 .\scripts\server-watchdog.ps1
 
 # Localhost RCON console commands

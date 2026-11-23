@@ -36,4 +36,5 @@ backups/*.zip
 admin/*.log
 admin/intentional-stop.flag
 admin/watchdog-state.json
+plugins/MYTownGatekeeper/player-activity.jsonl
 usercache.json

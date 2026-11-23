@@ -64,6 +64,7 @@ $filesToCopy = @(
   'permissions.yml',
   'plugins\MYTownGatekeeper\accounts.yml',
   'plugins\MYTownGatekeeper\config.yml',
+  'plugins\MYTownGatekeeper\player-activity.jsonl',
   'plugins\playit-gg\config.yml'
 )
 

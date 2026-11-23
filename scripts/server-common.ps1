@@ -1,7 +1,8 @@
 # Shared helper library for MY-Town server status, control, and watchdog scripts.
 
 function Get-McPaths {
-  param([string]$ServerRoot = (Split-Path -Parent $PSScriptRoot), [string]$TaskPrefix = 'MY-Town')
+  param([string]$ServerRoot = '', [string]$TaskPrefix = 'MY-Town')
+  if ([string]::IsNullOrWhiteSpace($ServerRoot)) { $ServerRoot = Split-Path -Parent $PSScriptRoot }
   $adminDir = Join-Path $ServerRoot 'admin'
   $logsDir  = Join-Path $ServerRoot 'logs'
   $javaExe  = $null

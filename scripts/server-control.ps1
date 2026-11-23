@@ -1,12 +1,14 @@
-param(
-  [Parameter(Mandatory)][ValidateSet('Start', 'Stop', 'Restart', 'RestartPlayit')][string]$Action,
+﻿param(
+  [Parameter(Mandatory)][ValidateSet('Start', 'Stop', 'Restart', 'RestartPlayit', 'ResetPassword', 'ClearLockout')][string]$Action,
+  [string]$Player = '',
   [string]$Reason = '',
-  [string]$ServerRoot = (Split-Path -Parent $PSScriptRoot),
+  [string]$ServerRoot = '',
   [string]$TaskPrefix = 'MY-Town',
   [int]$TimeoutSeconds = 45
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($ServerRoot)) { $ServerRoot = Split-Path -Parent $PSScriptRoot }
 . (Join-Path $PSScriptRoot 'server-common.ps1')
 
 $paths = Get-McPaths -ServerRoot $ServerRoot -TaskPrefix $TaskPrefix
@@ -118,5 +120,31 @@ switch ($Action) {
       $slp = Test-MinecraftSlp -TargetHost $hostName -Port 25565 -ResolveSrv -TimeoutMs 6000
       Write-Host "Public SLP ($($slp.SrvTarget)): Online=$($slp.Online) Latency=$($slp.LatencyMs)ms Error=$($slp.Error)"
     }
+  }
+  'ResetPassword' {
+    if ([string]::IsNullOrWhiteSpace($Player) -or ($Player -notmatch '^[a-zA-Z0-9_]{3,16}$')) {
+      throw "Specify a valid Minecraft username via -Player <Username> (3-16 alphanumeric/underscore characters)."
+    }
+    $res = Invoke-RconSafe -Paths $paths -Command "gatekeeper resetpassword $Player" -TimeoutMs 8000
+    if (-not $res.Ok) {
+      throw "RCON failed (is the server running?): $($res.Output)"
+    }
+    $cleanOut = ($res.Output -replace '§.', '').Trim()
+    Write-Host $cleanOut
+    $inviteFile = Join-Path $paths.AdminDir 'invite-code.txt'
+    if (Test-Path -LiteralPath $inviteFile) {
+      Write-Host "Next login: Reconnect in Minecraft and enter your Invite Code from '$inviteFile' to set a new personal password." -ForegroundColor Cyan
+    }
+  }
+  'ClearLockout' {
+    $target = if ([string]::IsNullOrWhiteSpace($Player)) { 'all' } else { $Player.Trim() }
+    if ($target -notmatch '^[a-zA-Z0-9_.:-]{1,64}$') {
+      throw "Invalid -Player / lockout target '$target'."
+    }
+    $res = Invoke-RconSafe -Paths $paths -Command "gatekeeper clearlockout $target" -TimeoutMs 8000
+    if (-not $res.Ok) {
+      throw "RCON failed (is the server running?): $($res.Output)"
+    }
+    Write-Host (($res.Output -replace '§.', '').Trim())
   }
 }

@@ -1,11 +1,12 @@
 ﻿param(
-  [string]$ServerRoot = (Split-Path -Parent $PSScriptRoot),
+  [string]$ServerRoot = '',
   [string]$TaskPrefix = 'MY-Town',
   [int]$RecentIncidents = 8,
   [switch]$Json
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($ServerRoot)) { $ServerRoot = Split-Path -Parent $PSScriptRoot }
 . (Join-Path $PSScriptRoot 'server-common.ps1')
 
 $paths = Get-McPaths -ServerRoot $ServerRoot -TaskPrefix $TaskPrefix

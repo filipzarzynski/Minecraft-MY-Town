@@ -440,7 +440,8 @@ try {
   $wdAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$wdScript`"" `
     -WorkingDirectory $ServerRoot
-  $wdTrigger = New-ScheduledTaskTrigger -Once -At ([datetime]::Today) -RepetitionInterval (New-TimeSpan -Minutes 2)
+  $wdTriggerLogon  = New-ScheduledTaskTrigger -AtLogOn -User $adminPrincipalName
+  $wdTriggerRepeat = New-ScheduledTaskTrigger -Once -At ([datetime]::Today) -RepetitionInterval (New-TimeSpan -Minutes 2)
   $wdPrincipal = New-ScheduledTaskPrincipal -UserId $adminPrincipalName -LogonType S4U -RunLevel Highest
   $wdSettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -450,10 +451,10 @@ try {
     -MultipleInstances IgnoreNew
   Register-ScheduledTask -TaskName $wdTaskName `
     -Action $wdAction `
-    -Trigger $wdTrigger `
+    -Trigger @($wdTriggerLogon, $wdTriggerRepeat) `
     -Principal $wdPrincipal `
     -Settings $wdSettings `
-    -Description "Monitors $TaskPrefix Purpur + Playit health every 2 minutes, auto-recovers crashes/hung tunnels, and logs downtime causes." | Out-Null
+    -Description "Monitors $TaskPrefix Purpur + Playit health on Windows logon and every 2 minutes, auto-recovers crashes/hung tunnels, and logs downtime causes." | Out-Null
   Log "Registered Scheduled Task '$wdTaskName' under $adminPrincipalName."
 
   # 6. Start Minecraft Server Scheduled Task

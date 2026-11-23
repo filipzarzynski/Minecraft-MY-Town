@@ -38,6 +38,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -47,10 +48,12 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
@@ -86,15 +89,18 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
     private static final int MAX_LOCKOUT_ENTRIES = 4096;
     private static final int MAX_INVITE_LENGTH = 128;
     private static final long POST_AUTH_SPAWN_TTL_MS = 30_000L;
+    private static final double HIGH_CAPACITY_WARN_RATIO = 0.80;
 
     private final SecureRandom secureRandom = new SecureRandom();
     private final Object stateLock = new Object();
+    private final Object activityLogLock = new Object();
     private final Semaphore pbkdf2Semaphore = new Semaphore(2);
 
     private final ConcurrentHashMap<PlayerCommonConnection, AuthSession> pendingAuth =
         new ConcurrentHashMap<>();
     private final Set<String> activeConfiguringUsers = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<String, Long> postAuthSpawningUsers = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> activePlayerJoinEpochMs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AccountRecord> accounts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, LockoutState> ipLockouts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, LockoutState> userLockouts = new ConcurrentHashMap<>();
@@ -108,12 +114,14 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
     private volatile long lockoutSeconds;
 
     private File accountsFile;
+    private File playerActivityFile;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
         loadConfigurationSettings();
         this.accountsFile = new File(getDataFolder(), "accounts.yml");
+        this.playerActivityFile = new File(getDataFolder(), "player-activity.jsonl");
         loadAccounts();
 
         Bukkit.getPluginManager().registerEvents(this, this);
@@ -124,6 +132,17 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
 
     @Override
     public void onDisable() {
+        int maxPlayers = Math.max(1, Bukkit.getMaxPlayers());
+        Collection<? extends Player> remaining = Bukkit.getOnlinePlayers();
+        int remainingCount = remaining.size();
+        for (Player p : remaining) {
+            Long joinMs = activePlayerJoinEpochMs.remove(p.getName().toLowerCase(Locale.ROOT));
+            Long durationSec = joinMs != null ? Math.max(0L, (System.currentTimeMillis() - joinMs) / 1000L) : null;
+            remainingCount = Math.max(0, remainingCount - 1);
+            recordPlayerActivity("QUIT_SHUTDOWN", p.getName(), p.getUniqueId().toString(), remainingCount, maxPlayers, durationSec);
+        }
+        activePlayerJoinEpochMs.clear();
+
         for (AuthSession session : pendingAuth.values()) {
             session.future.complete(DialogSubmission.abortedResult());
         }
@@ -227,12 +246,95 @@ public final class MYTownGatekeeperPlugin extends JavaPlugin implements Listener
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerJoin(PlayerJoinEvent event) {
-        postAuthSpawningUsers.remove(event.getPlayer().getName().toLowerCase(Locale.ROOT));
+        Player p = event.getPlayer();
+        String userKey = p.getName().toLowerCase(Locale.ROOT);
+        postAuthSpawningUsers.remove(userKey);
+        activePlayerJoinEpochMs.put(userKey, System.currentTimeMillis());
+        int online = Math.max(1, Bukkit.getOnlinePlayers().size());
+        int maxPlayers = Math.max(1, Bukkit.getMaxPlayers());
+        recordPlayerActivity("JOIN", p.getName(), p.getUniqueId().toString(), online, maxPlayers, null);
+        if (((double) online / (double) maxPlayers) >= HIGH_CAPACITY_WARN_RATIO) {
+            long pct = Math.round((online * 100.0) / maxPlayers);
+            getLogger().warning("High player capacity reached: " + online + "/" + maxPlayers
+                + " players online (" + pct + "%). Consider adjusting max-players or hardware allocation.");
+        }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerQuit(PlayerQuitEvent event) {
-        postAuthSpawningUsers.remove(event.getPlayer().getName().toLowerCase(Locale.ROOT));
+        Player p = event.getPlayer();
+        String userKey = p.getName().toLowerCase(Locale.ROOT);
+        postAuthSpawningUsers.remove(userKey);
+        Long joinMs = activePlayerJoinEpochMs.remove(userKey);
+        Long durationSec = joinMs != null ? Math.max(0L, (System.currentTimeMillis() - joinMs) / 1000L) : null;
+        int currentSize = Bukkit.getOnlinePlayers().size();
+        int onlineAfter = Bukkit.getOnlinePlayers().contains(p) ? Math.max(0, currentSize - 1) : currentSize;
+        int maxPlayers = Math.max(1, Bukkit.getMaxPlayers());
+        recordPlayerActivity("QUIT", p.getName(), p.getUniqueId().toString(), onlineAfter, maxPlayers, durationSec);
+    }
+
+    private void recordPlayerActivity(
+        String eventType,
+        String username,
+        String uuidStr,
+        int onlineCount,
+        int maxPlayers,
+        Long durationSec
+    ) {
+        if (playerActivityFile == null) {
+            return;
+        }
+        String line = "{\"timestamp\":\"" + jsonEscape(OffsetDateTime.now().toString())
+            + "\",\"event\":\"" + jsonEscape(eventType)
+            + "\",\"player\":\"" + jsonEscape(username)
+            + "\",\"uuid\":\"" + jsonEscape(uuidStr)
+            + "\",\"online\":" + onlineCount
+            + ",\"max_players\":" + maxPlayers
+            + ",\"duration_sec\":" + (durationSec != null ? durationSec.toString() : "null")
+            + "}" + System.lineSeparator();
+        synchronized (activityLogLock) {
+            try {
+                File dir = playerActivityFile.getParentFile();
+                if (dir != null && !dir.exists()) {
+                    dir.mkdirs();
+                }
+                Files.writeString(
+                    playerActivityFile.toPath(),
+                    line,
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.APPEND
+                );
+            } catch (IOException ex) {
+                getLogger().warning("Failed to append player-activity.jsonl: " + ex.getMessage());
+            }
+        }
+    }
+
+    private static String jsonEscape(String s) {
+        if (s == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\' -> sb.append("\\\\");
+                case '"' -> sb.append("\\\"");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                default -> {
+                    if (c < 0x20) {
+                        sb.append(String.format(Locale.ROOT, "\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+                }
+            }
+        }
+        return sb.toString();
     }
 
     /**
